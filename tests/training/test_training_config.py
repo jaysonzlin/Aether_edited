@@ -11,6 +11,7 @@ CONFIG_PATH = Path("configs/train/fixed_view_simgen_4h200.yaml")
 def test_first_run_config_has_the_agreed_fixed_view_constants():
     config = load_training_config(CONFIG_PATH)
 
+    assert config.data_root == "../simgen/runs/panda_ball_can"
     assert config.num_frames == 41
     assert (config.height, config.width, config.left_padding) == (480, 720, 120)
     assert config.history_slots == 4
