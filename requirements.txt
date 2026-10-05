@@ -5,6 +5,7 @@ diffusers>=0.32.2
 easydict>=1.13
 einops>=0.8.0
 hf_transfer>=0.1.8
+h5py>=3.11.0
 huggingface-hub>=0.27.1
 imageio>=2.33.1
 imageio-ffmpeg>=0.5.1
