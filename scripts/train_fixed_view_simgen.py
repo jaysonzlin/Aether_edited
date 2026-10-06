@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a finite CPU Stage-1 MSE check without downloading weights.",
     )
+    parser.add_argument(
+        "--gpu-smoke-test",
+        action="store_true",
+        help="Load configured weights and data, run one real CUDA optimizer step, then exit.",
+    )
     return parser.parse_args()
 
 
@@ -96,7 +101,12 @@ def _infinite_batches(dataloader):
         yield from dataloader
 
 
-def run_training(config) -> None:
+def training_steps(max_train_steps: int, gpu_smoke_test: bool) -> int:
+    """Keep the saved run configuration intact while capping GPU smoke mode."""
+    return 1 if gpu_smoke_test else max_train_steps
+
+
+def run_training(config, gpu_smoke_test: bool = False) -> None:
     import torch
     import torch.nn.functional as functional
     from accelerate import Accelerator
@@ -108,7 +118,10 @@ def run_training(config) -> None:
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
+    if gpu_smoke_test and (not torch.cuda.is_available() or accelerator.device.type != "cuda"):
+        raise RuntimeError("--gpu-smoke-test requires an available CUDA GPU")
     torch.manual_seed(config.seed)
+    max_train_steps = training_steps(config.max_train_steps, gpu_smoke_test)
     dataset = SimGenFixedViewDataset(config.data_root, config.sample_ids)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
     pipeline, transformer, vae, scheduler, prompt_embeds = _load_training_components(
@@ -162,14 +175,18 @@ def run_training(config) -> None:
                 return_dict=False,
             )[0]
             loss = functional.mse_loss(prediction.float(), noise.float())
+            if not torch.isfinite(loss):
+                raise RuntimeError("Stage-1 loss became non-finite")
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         if accelerator.sync_gradients and accelerator.is_main_process:
             accelerator.print(f"step={global_step} stage1_mse={loss.item():.6f}")
-        if global_step >= config.max_train_steps:
+        if global_step >= max_train_steps:
             break
+    if gpu_smoke_test:
+        accelerator.print("GPU smoke test passed: one finite Stage-1 optimizer step completed")
 
 
 def main() -> None:
@@ -182,7 +199,7 @@ def main() -> None:
     if args.smoke_test:
         _run_smoke_test()
         return
-    run_training(config)
+    run_training(config, gpu_smoke_test=args.gpu_smoke_test)
 
 
 if __name__ == "__main__":
