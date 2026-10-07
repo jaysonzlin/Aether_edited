@@ -98,6 +98,53 @@ def test_run_manifest_is_computed_once_on_rank_zero_and_broadcast(monkeypatch):
     assert calls == []
 
 
+def test_transformer_config_is_read_from_unwrapped_ddp_model():
+    from scripts.train_fixed_view_simgen import unwrapped_transformer_config
+
+    config = SimpleNamespace(use_rotary_positional_embeddings=True, ofs_embed_dim=8)
+    wrapped_transformer = SimpleNamespace(module=SimpleNamespace(config=config))
+    accelerator = SimpleNamespace(unwrap_model=lambda model: model.module)
+
+    assert unwrapped_transformer_config(wrapped_transformer, accelerator) is config
+
+
+def test_shared_run_manifest_uses_output_cache_and_forwards_force_rehash(
+    tmp_path, monkeypatch
+):
+    import aether.training.checkpointing as checkpointing
+    from scripts.train_fixed_view_simgen import shared_run_manifest
+
+    config = SimpleNamespace(output_dir=tmp_path)
+    calls = []
+
+    def fake_build_run_manifest(config, prediction_type, **kwargs):
+        calls.append((config, prediction_type, kwargs))
+        return {"schema_version": 2}
+
+    monkeypatch.setattr(checkpointing, "build_run_manifest", fake_build_run_manifest)
+    accelerator = SimpleNamespace(is_main_process=True, num_processes=1)
+
+    shared_run_manifest(
+        config,
+        "v_prediction",
+        accelerator,
+        SimpleNamespace(distributed=None),
+        force_rehash=True,
+    )
+
+    assert calls == [
+        (
+            config,
+            "v_prediction",
+            {
+                "show_progress": True,
+                "fingerprint_cache_path": tmp_path / "input_fingerprint_cache.json",
+                "force_rehash": True,
+            },
+        )
+    ]
+
+
 def test_adamw_uses_wan_video_hyperparameters():
     import torch
 

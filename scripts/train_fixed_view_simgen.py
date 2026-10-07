@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Checkpoint directory to restore; defaults to latest for training and fresh state for GPU smoke tests.",
     )
+    parser.add_argument(
+        "--force-input-rehash",
+        action="store_true",
+        help="Recompute all model and dataset SHA-256 fingerprints instead of reusing the metadata cache.",
+    )
     return parser.parse_args()
 
 
@@ -277,12 +282,21 @@ def resolve_resume_checkpoint(output_dir, resume: str | None, gpu_smoke_test: bo
     return Path(resume)
 
 
-def shared_run_manifest(config, prediction_type, accelerator, torch_module):
+def shared_run_manifest(
+    config, prediction_type, accelerator, torch_module, force_rehash: bool = False
+):
     """Fingerprint large assets once, then share the manifest with all DDP ranks."""
     from aether.training.checkpointing import build_run_manifest
 
     manifest = (
-        build_run_manifest(config, prediction_type, show_progress=True)
+        build_run_manifest(
+            config,
+            prediction_type,
+            show_progress=True,
+            fingerprint_cache_path=Path(config.output_dir)
+            / "input_fingerprint_cache.json",
+            force_rehash=force_rehash,
+        )
         if accelerator.is_main_process
         else None
     )
@@ -292,6 +306,11 @@ def shared_run_manifest(config, prediction_type, accelerator, torch_module):
     if manifests[0] is None:
         raise RuntimeError("rank zero did not broadcast the checkpoint run manifest")
     return manifests[0]
+
+
+def unwrapped_transformer_config(transformer, accelerator):
+    """Read architecture settings from the model behind an Accelerate wrapper."""
+    return accelerator.unwrap_model(transformer).config
 
 
 def run_preflight(config, torch_module=None) -> None:
@@ -475,6 +494,7 @@ def run_training(
     gpu_smoke_test: bool = False,
     resume: str | None = None,
     gpu_smoke_test_steps: int = 1,
+    force_input_rehash: bool = False,
 ) -> None:
     import torch
     import torch.nn.functional as functional
@@ -521,7 +541,11 @@ def run_training(
         config, accelerator
     )
     run_manifest = shared_run_manifest(
-        config, scheduler.config.prediction_type, accelerator, torch
+        config,
+        scheduler.config.prediction_type,
+        accelerator,
+        torch,
+        force_rehash=force_input_rehash,
     )
     if hasattr(transformer, "enable_gradient_checkpointing"):
         transformer.enable_gradient_checkpointing()
@@ -530,6 +554,7 @@ def run_training(
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )
+    transformer_config = unwrapped_transformer_config(transformer, accelerator)
     transformer.train()
     checkpoint = resolve_resume_checkpoint(config.output_dir, resume, gpu_smoke_test)
     completed_steps = 0
@@ -578,12 +603,12 @@ def run_training(
                         accelerator.device,
                         fps=12,
                     )
-                    if transformer.config.use_rotary_positional_embeddings
+                    if transformer_config.use_rotary_positional_embeddings
                     else None
                 )
                 ofs = (
                     None
-                    if transformer.config.ofs_embed_dim is None
+                    if transformer_config.ofs_embed_dim is None
                     else noisy_latents.new_full((1,), 2.0)
                 )
                 prediction = transformer(
@@ -704,6 +729,7 @@ def main() -> None:
         gpu_smoke_test=args.gpu_smoke_test,
         resume=args.resume,
         gpu_smoke_test_steps=args.gpu_smoke_test_steps or 1,
+        force_input_rehash=args.force_input_rehash,
     )
 
 

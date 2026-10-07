@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -176,3 +177,81 @@ def test_run_manifest_detects_same_size_model_weight_replacement(tmp_path):
     after = build_run_manifest(config, "v_prediction")
 
     assert before != after
+
+
+def test_run_manifest_reuses_cached_hashes_when_file_metadata_matches(tmp_path, monkeypatch):
+    import aether.training.checkpointing as checkpointing
+
+    config = _manifest_config(_write_manifest_fixture(tmp_path / "run"))
+    cache_path = tmp_path / "output" / "input_fingerprint_cache.json"
+    first = build_run_manifest(
+        config, "v_prediction", fingerprint_cache_path=cache_path
+    )
+
+    def unexpected_hash(_path):
+        raise AssertionError("unchanged inputs should reuse their cached SHA-256")
+
+    monkeypatch.setattr(checkpointing, "_file_sha256", unexpected_hash)
+    second = build_run_manifest(
+        config, "v_prediction", fingerprint_cache_path=cache_path
+    )
+
+    assert second == first
+
+
+def test_run_manifest_rehashes_only_files_with_changed_metadata(tmp_path, monkeypatch):
+    import aether.training.checkpointing as checkpointing
+
+    paths = _write_manifest_fixture(tmp_path / "run")
+    config = _manifest_config(paths)
+    cache_path = tmp_path / "output" / "input_fingerprint_cache.json"
+    before = build_run_manifest(
+        config, "v_prediction", fingerprint_cache_path=cache_path
+    )
+    changed_file = paths[0] / "transformer" / "model.safetensors"
+    old_stat = changed_file.stat()
+    changed_file.write_bytes(b"changed")
+    os.utime(
+        changed_file,
+        ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 2_000_000_000),
+    )
+
+    real_hash = checkpointing._file_sha256
+    hashed_paths = []
+
+    def record_hash(path):
+        hashed_paths.append(Path(path).resolve())
+        return real_hash(path)
+
+    monkeypatch.setattr(checkpointing, "_file_sha256", record_hash)
+    after = build_run_manifest(
+        config, "v_prediction", fingerprint_cache_path=cache_path
+    )
+
+    assert after != before
+    assert hashed_paths == [changed_file.resolve()]
+
+
+def test_force_rehash_bypasses_cached_hashes(tmp_path, monkeypatch):
+    import aether.training.checkpointing as checkpointing
+
+    config = _manifest_config(_write_manifest_fixture(tmp_path / "run"))
+    cache_path = tmp_path / "output" / "input_fingerprint_cache.json"
+    build_run_manifest(config, "v_prediction", fingerprint_cache_path=cache_path)
+
+    real_hash = checkpointing._file_sha256
+    hashed_paths = []
+
+    def record_hash(path):
+        hashed_paths.append(Path(path).resolve())
+        return real_hash(path)
+
+    monkeypatch.setattr(checkpointing, "_file_sha256", record_hash)
+    build_run_manifest(
+        config,
+        "v_prediction",
+        fingerprint_cache_path=cache_path,
+        force_rehash=True,
+    )
+
+    assert len(hashed_paths) == 13

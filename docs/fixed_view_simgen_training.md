@@ -80,6 +80,16 @@ both `step_<step>_target.mp4` and `step_<step>_generated.mp4`. The generated
 MP4 is a real 50-step Aether DPM rollout of `sample_0` at seed 42; its first
 13 raw RGB frames are replaced with the observed history for visual alignment.
 
+Model and dataset SHA-256 fingerprints are cached in
+`outputs/fixed_view_simgen/input_fingerprint_cache.json`. On later starts and
+requeues, the trainer reuses a cached digest when that file's resolved path,
+size, and nanosecond modification time are unchanged; new or changed files are
+hashed again. The resulting manifest is still checked against the checkpoint
+before state is restored. This metadata-based fast path assumes files are not
+replaced while preserving both size and modification time. Use
+`--force-input-rehash` on the training command to recompute every digest when a
+full content verification is desired. GPU smoke tests use the same cache too.
+
 ## Training metrics
 
 With W&B enabled, the trainer logs `train/loss`, `train/learning_rate`,

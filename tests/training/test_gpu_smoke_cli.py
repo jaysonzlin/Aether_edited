@@ -81,6 +81,19 @@ def test_training_leaves_resume_unset_for_context_sensitive_default(monkeypatch)
     assert args.resume is None
 
 
+def test_force_input_rehash_flag_is_available(monkeypatch):
+    training_script = _training_script_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_fixed_view_simgen.py", "--force-input-rehash"],
+    )
+
+    args = training_script.parse_args()
+
+    assert args.force_input_rehash is True
+
+
 def test_gpu_smoke_resume_resolution_starts_fresh_when_checkpoint_exists(tmp_path):
     from aether.training.checkpointing import save_checkpoint
     from scripts.train_fixed_view_simgen import resolve_resume_checkpoint

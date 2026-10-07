@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Mapping, Protocol
 
@@ -23,32 +25,144 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _inventory(directory: Path, show_progress: bool = False) -> list[dict[str, object]]:
+def _read_fingerprint_cache(cache_path: Path | None) -> dict[str, dict[str, object]]:
+    if cache_path is None:
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return {}
+    entries = payload.get("files")
+    if not isinstance(entries, dict):
+        return {}
+    return {
+        key: entry
+        for key, entry in entries.items()
+        if isinstance(key, str) and isinstance(entry, dict)
+    }
+
+
+def _write_fingerprint_cache(
+    cache_path: Path | None, entries: dict[str, dict[str, object]]
+) -> None:
+    if cache_path is None:
+        return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema_version": 1, "files": entries}
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_path.parent,
+            prefix=f".{cache_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(payload, temporary_file, sort_keys=True)
+            temporary_file.write("\n")
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _fingerprinted_file(
+    path: Path,
+    relative_path: str,
+    cached_entries: dict[str, dict[str, object]],
+    updated_entries: dict[str, dict[str, object]],
+    force_rehash: bool,
+) -> dict[str, object]:
+    stat = path.stat()
+    cache_key = str(path.resolve())
+    cached = cached_entries.get(cache_key)
+    sha256 = None
+    if not force_rehash and cached is not None:
+        if (
+            cached.get("size_bytes") == stat.st_size
+            and cached.get("mtime_ns") == stat.st_mtime_ns
+            and isinstance(cached.get("sha256"), str)
+        ):
+            sha256 = cached["sha256"]
+    if sha256 is None:
+        sha256 = _file_sha256(path)
+    updated_entries[cache_key] = {
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": sha256,
+    }
+    return {
+        "path": relative_path,
+        "size_bytes": stat.st_size,
+        "sha256": sha256,
+    }
+
+
+def _inventory(
+    directory: Path,
+    show_progress: bool = False,
+    cached_entries: dict[str, dict[str, object]] | None = None,
+    updated_entries: dict[str, dict[str, object]] | None = None,
+    force_rehash: bool = False,
+) -> list[dict[str, object]]:
     from tqdm.auto import tqdm
 
+    cached_entries = cached_entries or {}
+    updated_entries = updated_entries if updated_entries is not None else {}
     entries = []
     paths = sorted(item for item in directory.rglob("*") if item.is_file())
-    for path in tqdm(paths, desc=f"Hashing {directory.name}", unit="file", disable=not show_progress):
-        entry: dict[str, object] = {
-            "path": path.relative_to(directory).as_posix(),
-            "size_bytes": path.stat().st_size,
-        }
-        entry["sha256"] = _file_sha256(path)
-        entries.append(entry)
+    for path in tqdm(
+        paths,
+        desc=f"Fingerprinting {directory.name}",
+        unit="file",
+        disable=not show_progress,
+    ):
+        entries.append(
+            _fingerprinted_file(
+                path,
+                path.relative_to(directory).as_posix(),
+                cached_entries,
+                updated_entries,
+                force_rehash,
+            )
+        )
     return entries
 
 
 def build_run_manifest(
-    config, prediction_type: str, show_progress: bool = False
+    config,
+    prediction_type: str,
+    show_progress: bool = False,
+    fingerprint_cache_path: str | Path | None = None,
+    force_rehash: bool = False,
 ) -> dict[str, object]:
     """Build path-independent run identity for safe checkpoint restoration."""
+    cache_path = Path(fingerprint_cache_path) if fingerprint_cache_path is not None else None
+    cached_entries = {} if force_rehash else _read_fingerprint_cache(cache_path)
+    updated_entries: dict[str, dict[str, object]] = {}
     aether_root = Path(config.aether_model_id) / "transformer"
     cogvideox_root = Path(config.cogvideox_model_id)
     data_root = Path(config.data_root)
     model_identity = {
-        "aether_transformer": _inventory(aether_root, show_progress=show_progress),
+        "aether_transformer": _inventory(
+            aether_root,
+            show_progress=show_progress,
+            cached_entries=cached_entries,
+            updated_entries=updated_entries,
+            force_rehash=force_rehash,
+        ),
         "cogvideox": {
-            component: _inventory(cogvideox_root / component, show_progress=show_progress)
+            component: _inventory(
+                cogvideox_root / component,
+                show_progress=show_progress,
+                cached_entries=cached_entries,
+                updated_entries=updated_entries,
+                force_rehash=force_rehash,
+            )
             for component in ("tokenizer", "text_encoder", "vae", "scheduler")
         },
     }
@@ -62,15 +176,18 @@ def build_run_manifest(
             {
                 "sample_id": int(sample_id),
                 "files": [
-                    {
-                        "path": path.relative_to(data_root).as_posix(),
-                        "size_bytes": path.stat().st_size,
-                        "sha256": _file_sha256(path),
-                    }
+                    _fingerprinted_file(
+                        path,
+                        path.relative_to(data_root).as_posix(),
+                        cached_entries,
+                        updated_entries,
+                        force_rehash,
+                    )
                     for path in files
                 ],
             }
         )
+    _write_fingerprint_cache(cache_path, updated_entries)
     return {
         "schema_version": 2,
         "objective": {
