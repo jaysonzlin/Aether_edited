@@ -93,6 +93,11 @@ def _run_smoke_test() -> None:
     print(f"smoke-test Stage-1 MSE: {loss.item():.6f}")
 
 
+def prepare_frozen_prompt_embeddings(prompt_embeds, device):
+    """Detach static text conditioning before reusing it across training steps."""
+    return prompt_embeds.detach().to(device=device)
+
+
 def _load_training_components(config, accelerator):
     import torch
     from diffusers import (
@@ -117,16 +122,19 @@ def _load_training_components(config, accelerator):
     transformer = CogVideoXTransformer3DModel.from_pretrained(
         config.aether_model_id, subfolder="transformer", torch_dtype=torch.bfloat16
     )
-    pipeline = AetherV1PipelineCogVideoX(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        vae=vae,
-        scheduler=scheduler,
-        transformer=transformer,
-    )
-    vae.requires_grad_(False).eval().to(accelerator.device)
     text_encoder.requires_grad_(False).eval()
-    prompt_embeds = pipeline.empty_prompt_embeds.to(accelerator.device)
+    with torch.no_grad():
+        pipeline = AetherV1PipelineCogVideoX(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            vae=vae,
+            scheduler=scheduler,
+            transformer=transformer,
+        )
+    vae.requires_grad_(False).eval().to(accelerator.device)
+    prompt_embeds = prepare_frozen_prompt_embeddings(
+        pipeline.empty_prompt_embeds, accelerator.device
+    )
     return pipeline, transformer, vae, scheduler, prompt_embeds
 
 

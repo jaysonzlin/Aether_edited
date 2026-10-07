@@ -108,6 +108,20 @@ def test_transformer_config_is_read_from_unwrapped_ddp_model():
     assert unwrapped_transformer_config(wrapped_transformer, accelerator) is config
 
 
+def test_frozen_prompt_embeddings_can_be_reused_across_backward_passes():
+    import torch
+    from scripts.train_fixed_view_simgen import prepare_frozen_prompt_embeddings
+
+    encoded = torch.ones((1, 2), requires_grad=True) * 2
+    prompt_embeds = prepare_frozen_prompt_embeddings(encoded, torch.device("cpu"))
+    trainable = torch.nn.Parameter(torch.tensor(1.0))
+
+    assert prompt_embeds.requires_grad is False
+    for _ in range(2):
+        (trainable * prompt_embeds).sum().backward()
+        trainable.grad = None
+
+
 def test_shared_run_manifest_uses_output_cache_and_forwards_force_rehash(
     tmp_path, monkeypatch
 ):
