@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume",
-        default="latest",
-        help="Checkpoint directory to restore, or 'latest' to resume the newest output checkpoint.",
+        default=None,
+        help="Checkpoint directory to restore; defaults to latest for training and fresh state for GPU smoke tests.",
     )
     return parser.parse_args()
 
@@ -119,8 +119,118 @@ def training_steps(max_train_steps: int, gpu_smoke_test: bool) -> int:
     return 1 if gpu_smoke_test else max_train_steps
 
 
+def diffusion_training_target(scheduler, target_latents, noise, timesteps):
+    """Return the Stage-1 target matching the loaded scheduler parameterization."""
+    prediction_type = getattr(scheduler.config, "prediction_type", None)
+    if prediction_type == "epsilon":
+        return noise
+    if prediction_type == "v_prediction":
+        return scheduler.get_velocity(target_latents, noise, timesteps)
+    raise ValueError(
+        "unsupported scheduler prediction_type "
+        f"{prediction_type!r}; expected 'epsilon' or 'v_prediction'"
+    )
+
+
+def build_optimizer(transformer, config, torch_module=None):
+    """Build the Wan-video AdamW variant used by this fine-tuning path."""
+    if torch_module is None:
+        import torch as torch_module
+    return torch_module.optim.AdamW(
+        transformer.parameters(),
+        lr=config.learning_rate,
+        betas=(config.adam_beta1, config.adam_beta2),
+        eps=config.adam_epsilon,
+        weight_decay=config.weight_decay,
+    )
+
+
+def build_lr_scheduler(optimizer, config):
+    from transformers import get_constant_schedule_with_warmup
+
+    return get_constant_schedule_with_warmup(
+        optimizer, num_warmup_steps=config.warmup_steps
+    )
+
+
+def accelerator_options(config) -> dict[str, object]:
+    """Keep prepared LR schedulers on optimizer-update rather than per-rank time."""
+    return {
+        "mixed_precision": config.mixed_precision,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "log_with": config.report_to,
+        "step_scheduler_with_optimizer": False,
+    }
+
+
+def optimizer_update(accelerator, optimizer, lr_scheduler, transformer, max_grad_norm):
+    """Clip before synchronized updates and advance warmup only per optimizer step."""
+    grad_norm = None
+    if accelerator.sync_gradients:
+        grad_norm = accelerator.clip_grad_norm_(
+            transformer.parameters(), max_grad_norm
+        )
+    optimizer.step()
+    if accelerator.sync_gradients:
+        lr_scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    return grad_norm
+
+
 def has_remaining_steps(completed_steps: int, max_train_steps: int) -> bool:
     return completed_steps < max_train_steps
+
+
+def advance_optimizer_step(global_step: int, sync_gradients: bool) -> int:
+    """Count optimizer updates, not the microbatches used to accumulate them."""
+    return global_step + int(sync_gradients)
+
+
+def optimizer_step_status(
+    global_step: int,
+    sync_gradients: bool,
+    max_train_steps: int,
+    output_interval: int,
+) -> tuple[int, bool, bool]:
+    """Return updated step, checkpoint boundary, and completion after a microbatch."""
+    if not sync_gradients:
+        return global_step, False, False
+    global_step = advance_optimizer_step(global_step, True)
+    return (
+        global_step,
+        global_step % output_interval == 0,
+        global_step >= max_train_steps,
+    )
+
+
+def resolve_resume_checkpoint(output_dir, resume: str | None, gpu_smoke_test: bool):
+    """Resolve normal resume defaults while guaranteeing a fresh smoke test."""
+    from aether.training.checkpointing import latest_checkpoint
+
+    if gpu_smoke_test:
+        if resume is not None:
+            raise ValueError("--gpu-smoke-test cannot be combined with --resume")
+        return None
+    if resume in (None, "latest"):
+        return latest_checkpoint(output_dir)
+    return Path(resume)
+
+
+def shared_run_manifest(config, prediction_type, accelerator, torch_module):
+    """Fingerprint large assets once, then share the manifest with all DDP ranks."""
+    from aether.training.checkpointing import build_run_manifest
+
+    manifest = (
+        build_run_manifest(config, prediction_type, show_progress=True)
+        if accelerator.is_main_process
+        else None
+    )
+    manifests = [manifest]
+    if accelerator.num_processes > 1:
+        torch_module.distributed.broadcast_object_list(manifests, src=0)
+    if manifests[0] is None:
+        raise RuntimeError("rank zero did not broadcast the checkpoint run manifest")
+    return manifests[0]
 
 
 def run_preflight(config, torch_module=None) -> None:
@@ -128,14 +238,7 @@ def run_preflight(config, torch_module=None) -> None:
     if torch_module is None:
         import torch as torch_module
 
-    required_model_paths = (
-        Path(config.aether_model_id) / "transformer",
-        *(Path(config.cogvideox_model_id) / name for name in ("tokenizer", "text_encoder", "vae", "scheduler")),
-    )
-    missing = [str(path) for path in required_model_paths if not path.is_dir()]
-    if missing:
-        raise FileNotFoundError("missing required local model directories: " + ", ".join(missing))
-
+    validate_local_model_files(config)
     SimGenFixedViewDataset(config.data_root, config.sample_ids)
     if not torch_module.cuda.is_available():
         raise RuntimeError("preflight requires CUDA")
@@ -144,6 +247,47 @@ def run_preflight(config, torch_module=None) -> None:
     if not torch_module.cuda.is_bf16_supported():
         raise RuntimeError("preflight requires CUDA bf16 support")
     print("preflight passed: data, local model layout, four GPUs, and bf16 are ready")
+
+
+def validate_local_model_files(config) -> None:
+    """Fail before model loading when local Hugging Face components are incomplete."""
+    aether_transformer = Path(config.aether_model_id) / "transformer"
+    cogvideox_root = Path(config.cogvideox_model_id)
+    missing = []
+
+    def require_file(path: Path) -> None:
+        if not path.is_file():
+            missing.append(str(path))
+
+    def require_weights(component: Path) -> None:
+        patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth")
+        if not any(any(component.rglob(pattern)) for pattern in patterns):
+            missing.append(f"{component}/<model weights (*.safetensors or *.bin)>")
+
+    require_file(aether_transformer / "config.json")
+    require_weights(aether_transformer)
+
+    tokenizer = cogvideox_root / "tokenizer"
+    require_file(tokenizer / "tokenizer_config.json")
+    tokenizer_assets = (
+        tokenizer / "tokenizer.json",
+        tokenizer / "spiece.model",
+        tokenizer / "vocab.json",
+    )
+    if not any(path.is_file() for path in tokenizer_assets):
+        missing.append(f"{tokenizer}/<tokenizer.json, spiece.model, or vocab.json>")
+
+    for component_name in ("text_encoder", "vae"):
+        component = cogvideox_root / component_name
+        require_file(component / "config.json")
+        require_weights(component)
+    require_file(cogvideox_root / "scheduler" / "scheduler_config.json")
+
+    if missing:
+        raise FileNotFoundError(
+            "incomplete local model files; missing required artifacts: "
+            + ", ".join(missing)
+        )
 
 
 def fixed_rollout_batch(dataset, device):
@@ -182,7 +326,7 @@ def save_fixed_rollout_artifacts(
     scheduler,
     prompt_embeds,
     global_step: int,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path, Path]:
     """Generate rank-zero's deterministic fixed-sample target and rollout MP4s."""
     import torch
 
@@ -192,7 +336,11 @@ def save_fixed_rollout_artifacts(
         require_41_frames,
         sample_aether_latents,
     )
-    from aether.training.visualization import save_fixed_rollout
+    from aether.training.visualization import (
+        decoded_disparity_to_viridis_frames,
+        normalized_disparity_to_viridis_frames,
+        save_fixed_rollout,
+    )
 
     fixed_batch = fixed_rollout_batch(dataset, accelerator.device)
     cuda_devices = [accelerator.device.index or 0] if accelerator.device.type == "cuda" else []
@@ -231,145 +379,229 @@ def save_fixed_rollout_artifacts(
             ofs,
             seed=config.seed,
             num_inference_steps=50,
+            show_progress=accelerator.is_main_process,
         )
         rgb_latents = rollout_latents[:, :, :16]
+        disparity_latents = rollout_latents[:, :, 16:32]
         decoded_rgb = pipeline.video_processor.postprocess_video(
             video=pipeline.decode_latents(rgb_latents), output_type="np"
         )
+        decoded_disparity = pipeline.decode_latents(disparity_latents)
         generated_rgb = _decoded_rgb_batch(decoded_rgb).to(fixed_batch["rgb"].device)
         require_41_frames(generated_rgb)
         generated_rgb = composite_history(generated_rgb, fixed_batch["rgb"], history_frames=13)
+        generated_disparity = decoded_disparity_to_viridis_frames(
+            decoded_disparity.detach().float().cpu().numpy()
+        )
+        target_disparity = normalized_disparity_to_viridis_frames(
+            fixed_batch["disparity"][0].detach().float().cpu().numpy()
+        )
         return save_fixed_rollout(
             config.output_dir,
             global_step,
             target_rgb=fixed_batch["rgb"][0].permute(0, 2, 3, 1).cpu().numpy(),
             generated_rgb=generated_rgb[0].permute(0, 2, 3, 1).cpu().numpy(),
+            target_disparity=target_disparity,
+            generated_disparity=generated_disparity,
             fps=FIXED_VIEW_ROLLOUT_FPS,
         )
     finally:
         rollout_model.train(was_training)
 
 
-def run_training(config, gpu_smoke_test: bool = False, resume: str | None = "latest") -> None:
+def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None) -> None:
     import torch
     import torch.nn.functional as functional
     from accelerate import Accelerator
+    from tqdm.auto import tqdm
     from torch.utils.data import DataLoader
 
     from aether.training.aether_latents import assemble_aether_training_batch
     from aether.training.checkpointing import (
-        latest_checkpoint,
         restore_checkpoint,
         save_checkpoint,
     )
 
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-    )
+    accelerator = Accelerator(**accelerator_options(config))
+    if config.report_to:
+        accelerator.init_trackers(
+            config.wandb_project,
+            config={
+                "learning_rate": config.learning_rate,
+                "max_train_steps": config.max_train_steps,
+                "warmup_steps": config.warmup_steps,
+                "adam_beta1": config.adam_beta1,
+                "adam_beta2": config.adam_beta2,
+                "adam_epsilon": config.adam_epsilon,
+                "weight_decay": config.weight_decay,
+                "max_grad_norm": config.max_grad_norm,
+            },
+        )
     if gpu_smoke_test and (not torch.cuda.is_available() or accelerator.device.type != "cuda"):
         raise RuntimeError("--gpu-smoke-test requires an available CUDA GPU")
     torch.manual_seed(config.seed)
     max_train_steps = training_steps(config.max_train_steps, gpu_smoke_test)
     dataset = SimGenFixedViewDataset(config.data_root, config.sample_ids)
-    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.train_batch_size,
+        shuffle=True,
+        num_workers=config.dataloader_num_workers,
+        pin_memory=config.pin_memory,
+    )
     pipeline, transformer, vae, scheduler, prompt_embeds = _load_training_components(
         config, accelerator
     )
+    run_manifest = shared_run_manifest(
+        config, scheduler.config.prediction_type, accelerator, torch
+    )
     if hasattr(transformer, "enable_gradient_checkpointing"):
         transformer.enable_gradient_checkpointing()
-    optimizer = torch.optim.AdamW(transformer.parameters(), lr=config.learning_rate)
-    transformer, optimizer, dataloader = accelerator.prepare(transformer, optimizer, dataloader)
+    optimizer = build_optimizer(transformer, config, torch)
+    lr_scheduler = build_lr_scheduler(optimizer, config)
+    transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        transformer, optimizer, dataloader, lr_scheduler
+    )
     transformer.train()
-    if resume == "latest":
-        checkpoint = latest_checkpoint(config.output_dir)
-    elif resume:
-        checkpoint = Path(resume)
-    else:
-        checkpoint = None
+    checkpoint = resolve_resume_checkpoint(config.output_dir, resume, gpu_smoke_test)
     completed_steps = 0
     if checkpoint is not None:
-        completed_steps = restore_checkpoint(accelerator, checkpoint)
+        completed_steps = restore_checkpoint(
+            accelerator, checkpoint, expected_manifest=run_manifest
+        )
         accelerator.print(f"resumed checkpoint {checkpoint} at step {completed_steps}")
     if not has_remaining_steps(completed_steps, max_train_steps):
         accelerator.print(f"training already completed at step {completed_steps}")
+        if config.report_to:
+            accelerator.end_training()
         return
 
-    for global_step, batch in enumerate(
-        _infinite_batches(dataloader), start=completed_steps + 1
-    ):
-        with accelerator.accumulate(transformer):
-            model_batch = {
-                key: value.to(accelerator.device)
-                for key, value in batch.items()
-                if key in {"rgb", "disparity", "raymap"}
-            }
-            assembled = assemble_aether_training_batch(model_batch, vae, config.history_slots)
-            target_latents = assembled.target_latents
-            noise = torch.randn_like(target_latents)
-            timesteps = torch.randint(
-                0,
-                scheduler.config.num_train_timesteps,
-                (target_latents.shape[0],),
-                device=target_latents.device,
-            ).long()
-            noisy_latents = scheduler.add_noise(target_latents, noise, timesteps)
-            rotary_emb = (
-                pipeline._prepare_rotary_positional_embeddings(
-                    config.height,
-                    config.width,
-                    noisy_latents.shape[1],
-                    accelerator.device,
-                    fps=12,
+    global_step = completed_steps
+    progress = tqdm(
+        total=max_train_steps,
+        initial=completed_steps,
+        desc="Aether training",
+        unit="step",
+        disable=not accelerator.is_main_process,
+    )
+    try:
+        for batch in _infinite_batches(dataloader):
+            with accelerator.accumulate(transformer):
+                model_batch = {
+                    key: value.to(accelerator.device)
+                    for key, value in batch.items()
+                    if key in {"rgb", "disparity", "raymap"}
+                }
+                assembled = assemble_aether_training_batch(model_batch, vae, config.history_slots)
+                target_latents = assembled.target_latents
+                noise = torch.randn_like(target_latents)
+                timesteps = torch.randint(
+                    0,
+                    scheduler.config.num_train_timesteps,
+                    (target_latents.shape[0],),
+                    device=target_latents.device,
+                ).long()
+                noisy_latents = scheduler.add_noise(target_latents, noise, timesteps)
+                rotary_emb = (
+                    pipeline._prepare_rotary_positional_embeddings(
+                        config.height,
+                        config.width,
+                        noisy_latents.shape[1],
+                        accelerator.device,
+                        fps=12,
+                    )
+                    if transformer.config.use_rotary_positional_embeddings
+                    else None
                 )
-                if transformer.config.use_rotary_positional_embeddings
-                else None
-            )
-            ofs = (
-                None
-                if transformer.config.ofs_embed_dim is None
-                else noisy_latents.new_full((1,), 2.0)
-            )
-            prediction = transformer(
-                hidden_states=torch.cat((noisy_latents, assembled.condition_latents), dim=2),
-                encoder_hidden_states=prompt_embeds.repeat(target_latents.shape[0], 1, 1),
-                timestep=timesteps,
-                ofs=ofs,
-                image_rotary_emb=rotary_emb,
-                return_dict=False,
-            )[0]
-            loss = functional.mse_loss(prediction.float(), noise.float())
-            if not torch.isfinite(loss):
-                raise RuntimeError("Stage-1 loss became non-finite")
-            accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                ofs = (
+                    None
+                    if transformer.config.ofs_embed_dim is None
+                    else noisy_latents.new_full((1,), 2.0)
+                )
+                prediction = transformer(
+                    hidden_states=torch.cat((noisy_latents, assembled.condition_latents), dim=2),
+                    encoder_hidden_states=prompt_embeds.repeat(target_latents.shape[0], 1, 1),
+                    timestep=timesteps,
+                    ofs=ofs,
+                    image_rotary_emb=rotary_emb,
+                    return_dict=False,
+                )[0]
+                training_target = diffusion_training_target(
+                    scheduler, target_latents, noise, timesteps
+                )
+                loss = functional.mse_loss(prediction.float(), training_target.float())
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Stage-1 loss became non-finite")
+                accelerator.backward(loss)
+                grad_norm = optimizer_update(
+                    accelerator,
+                    optimizer,
+                    lr_scheduler,
+                    transformer,
+                    config.max_grad_norm,
+                )
 
-        if accelerator.sync_gradients and accelerator.is_main_process:
-            accelerator.print(f"step={global_step} stage1_mse={loss.item():.6f}")
-        if accelerator.sync_gradients and global_step % config.output_interval == 0:
-            checkpoint = save_checkpoint(
-                accelerator, config.output_dir, global_step, keep_last=2
+            global_step, checkpoint_due, training_complete = optimizer_step_status(
+                global_step,
+                accelerator.sync_gradients,
+                max_train_steps,
+                config.output_interval,
             )
-            if accelerator.is_main_process:
-                accelerator.print(f"saved checkpoint: {checkpoint}")
-                target_path, generated_path = save_fixed_rollout_artifacts(
-                    accelerator=accelerator,
-                    config=config,
-                    dataset=dataset,
-                    pipeline=pipeline,
-                    transformer=transformer,
-                    vae=vae,
-                    scheduler=scheduler,
-                    prompt_embeds=prompt_embeds,
-                    global_step=global_step,
+            if accelerator.sync_gradients:
+                learning_rate = lr_scheduler.get_last_lr()[0]
+                grad_norm_value = (
+                    float(grad_norm.detach().float().item())
+                    if grad_norm is not None
+                    else 0.0
                 )
-                accelerator.print(
-                    f"saved fixed rollout: target={target_path} generated={generated_path}"
-                )
-            accelerator.wait_for_everyone()
-        if global_step >= max_train_steps:
-            break
+                if accelerator.is_main_process:
+                    progress.update(1)
+                    progress.set_postfix(
+                        loss=f"{loss.item():.5f}",
+                        lr=f"{learning_rate:.2e}",
+                        grad_norm=f"{grad_norm_value:.3f}",
+                    )
+                if config.report_to and accelerator.is_main_process:
+                    accelerator.log(
+                        {
+                            "train/loss": float(loss.detach().float().item()),
+                            "train/learning_rate": float(learning_rate),
+                            "train/grad_norm": grad_norm_value,
+                        },
+                        step=global_step,
+                    )
+                if checkpoint_due:
+                    checkpoint = save_checkpoint(
+                        accelerator,
+                        config.output_dir,
+                        global_step,
+                        run_manifest=run_manifest,
+                        keep_last=2,
+                    )
+                    if accelerator.is_main_process:
+                        accelerator.print(f"saved checkpoint: {checkpoint}")
+                        artifact_paths = save_fixed_rollout_artifacts(
+                            accelerator=accelerator,
+                            config=config,
+                            dataset=dataset,
+                            pipeline=pipeline,
+                            transformer=transformer,
+                            vae=vae,
+                            scheduler=scheduler,
+                            prompt_embeds=prompt_embeds,
+                            global_step=global_step,
+                        )
+                        accelerator.print(
+                            "saved fixed rollout artifacts: "
+                            + ", ".join(str(path) for path in artifact_paths)
+                        )
+                    accelerator.wait_for_everyone()
+                if training_complete:
+                    break
+    finally:
+        progress.close()
+        if config.report_to:
+            accelerator.end_training()
     if gpu_smoke_test:
         accelerator.print("GPU smoke test passed: one finite Stage-1 optimizer step completed")
 
@@ -387,6 +619,8 @@ def main() -> None:
     if args.smoke_test:
         _run_smoke_test()
         return
+    if args.gpu_smoke_test and args.resume is not None:
+        raise SystemExit("--gpu-smoke-test cannot be combined with --resume")
     run_training(config, gpu_smoke_test=args.gpu_smoke_test, resume=args.resume)
 
 

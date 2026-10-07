@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -28,6 +29,16 @@ class FixedViewTrainingConfig:
     learning_rate: float
     train_batch_size: int
     gradient_accumulation_steps: int
+    adam_beta1: float
+    adam_beta2: float
+    adam_epsilon: float
+    weight_decay: float
+    warmup_steps: int
+    max_grad_norm: float
+    dataloader_num_workers: int
+    pin_memory: bool
+    report_to: str | None
+    wandb_project: str
     seed: int
     output_dir: str
     aether_model_id: str
@@ -82,6 +93,33 @@ def _validate(raw: dict[str, Any]) -> FixedViewTrainingConfig:
         raise TrainingConfigError("learning_rate and train_batch_size must be positive")
     if config.gradient_accumulation_steps <= 0:
         raise TrainingConfigError("gradient_accumulation_steps must be positive")
+    numeric_fields = ("adam_beta1", "adam_beta2", "adam_epsilon", "weight_decay", "max_grad_norm")
+    if any(
+        isinstance(getattr(config, name), bool)
+        or not isinstance(getattr(config, name), (int, float))
+        for name in numeric_fields
+    ):
+        raise TrainingConfigError(f"{', '.join(numeric_fields)} must be numeric")
+    if not 0.0 <= config.adam_beta1 < 1.0:
+        raise TrainingConfigError("adam_beta1 must be in [0, 1)")
+    if not 0.0 <= config.adam_beta2 < 1.0:
+        raise TrainingConfigError("adam_beta2 must be in [0, 1)")
+    if not math.isfinite(config.adam_epsilon) or config.adam_epsilon <= 0:
+        raise TrainingConfigError("adam_epsilon must be finite and positive")
+    if not math.isfinite(config.weight_decay) or config.weight_decay < 0:
+        raise TrainingConfigError("weight_decay must be finite and non-negative")
+    if type(config.warmup_steps) is not int or not 0 <= config.warmup_steps < config.max_train_steps:
+        raise TrainingConfigError("warmup_steps must be an integer in [0, max_train_steps)")
+    if not math.isfinite(config.max_grad_norm) or config.max_grad_norm <= 0:
+        raise TrainingConfigError("max_grad_norm must be finite and positive")
+    if type(config.dataloader_num_workers) is not int or config.dataloader_num_workers < 0:
+        raise TrainingConfigError("dataloader_num_workers must be a non-negative integer")
+    if not isinstance(config.pin_memory, bool):
+        raise TrainingConfigError("pin_memory must be boolean")
+    if config.report_to not in (None, "wandb"):
+        raise TrainingConfigError("report_to must be 'wandb' or null")
+    if not isinstance(config.wandb_project, str) or not config.wandb_project.strip():
+        raise TrainingConfigError("wandb_project must be a non-empty string")
     return config
 
 

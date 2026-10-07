@@ -12,6 +12,16 @@ mixed_precision: bf16
 learning_rate: 1.0e-5
 train_batch_size: 1
 gradient_accumulation_steps: 1
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_epsilon: 1.0e-8
+weight_decay: 0.1
+warmup_steps: 200
+max_grad_norm: 2.0
+dataloader_num_workers: 4
+pin_memory: true
+report_to: wandb
+wandb_project: aether-fixed-view-simgen
 seed: 42
 output_dir: outputs/fixed_view_simgen
 aether_model_id: models/AetherV1

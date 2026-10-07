@@ -23,3 +23,13 @@ def test_accelerate_config_is_one_machine_four_gpu_bf16_ddp():
     assert "mixed_precision: bf16" in contents
     assert "num_machines: 1" in contents
     assert "num_processes: 4" in contents
+
+
+def test_slurm_log_output_directory_is_present_in_a_fresh_checkout():
+    launcher = Path("submit_fixed_view_simgen_4gpu_mamba.sh").read_text()
+    ignore = Path(".gitignore").read_text()
+
+    assert "#SBATCH --output=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/logs/" in launcher
+    assert "#SBATCH --error=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/logs/" in launcher
+    assert Path("logs/.gitkeep").is_file()
+    assert "!/logs/.gitkeep" in ignore

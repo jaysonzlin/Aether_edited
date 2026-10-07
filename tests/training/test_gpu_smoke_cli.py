@@ -29,13 +29,66 @@ def test_gpu_smoke_mode_runs_exactly_one_optimizer_step(monkeypatch):
     assert training_script.training_steps(10_000, gpu_smoke_test=True) == 1
 
 
-def test_training_defaults_to_resuming_the_latest_checkpoint(monkeypatch):
+def test_training_leaves_resume_unset_for_context_sensitive_default(monkeypatch):
     training_script = _training_script_module()
     monkeypatch.setattr(sys, "argv", ["train_fixed_view_simgen.py"])
 
     args = training_script.parse_args()
 
-    assert args.resume == "latest"
+    assert args.resume is None
+
+
+def test_gpu_smoke_resume_resolution_starts_fresh_when_checkpoint_exists(tmp_path):
+    from aether.training.checkpointing import save_checkpoint
+    from scripts.train_fixed_view_simgen import resolve_resume_checkpoint
+
+    class Accelerator:
+        def save_state(self, path):
+            Path(path).mkdir()
+
+    save_checkpoint(
+        Accelerator(),
+        tmp_path,
+        global_step=1_000,
+        run_manifest={"schema_version": 1},
+    )
+
+    assert resolve_resume_checkpoint(tmp_path, resume=None, gpu_smoke_test=True) is None
+
+
+def test_gpu_smoke_rejects_explicit_resume():
+    import pytest
+
+    from scripts.train_fixed_view_simgen import resolve_resume_checkpoint
+
+    with pytest.raises(ValueError, match="cannot be combined with --resume"):
+        resolve_resume_checkpoint("outputs", resume="latest", gpu_smoke_test=True)
+
+
+def test_global_step_advances_only_after_synchronized_optimizer_update():
+    from scripts.train_fixed_view_simgen import optimizer_step_status
+
+    step = 17
+    save_due = False
+    done = False
+    for sync_gradients in (False, False, True):
+        step, save_due, done = optimizer_step_status(
+            step, sync_gradients, max_train_steps=18, output_interval=18
+        )
+
+    assert step == 18
+    assert save_due is True
+    assert done is True
+
+
+def test_unsynchronized_microbatch_does_not_trigger_checkpoint_or_stop():
+    from scripts.train_fixed_view_simgen import optimizer_step_status
+
+    step, save_due, done = optimizer_step_status(
+        999, False, max_train_steps=1_000, output_interval=1_000
+    )
+
+    assert (step, save_due, done) == (999, False, False)
 
 
 def test_completed_run_does_not_take_an_extra_optimizer_step():
@@ -71,9 +124,21 @@ def test_preflight_checks_model_layout_data_and_four_bf16_gpus(tmp_path, monkeyp
     training_script = _training_script_module()
     aether_model = tmp_path / "AetherV1"
     cogvideox_model = tmp_path / "CogVideoX-5b-I2V"
-    (aether_model / "transformer").mkdir(parents=True)
+    transformer_dir = aether_model / "transformer"
+    transformer_dir.mkdir(parents=True)
+    (transformer_dir / "config.json").write_text("{}")
+    (transformer_dir / "model.safetensors").write_bytes(b"weights")
     for name in ("tokenizer", "text_encoder", "vae", "scheduler"):
-        (cogvideox_model / name).mkdir(parents=True)
+        component_dir = cogvideox_model / name
+        component_dir.mkdir(parents=True)
+        if name == "tokenizer":
+            (component_dir / "tokenizer_config.json").write_text("{}")
+            (component_dir / "spiece.model").write_bytes(b"tokenizer")
+        elif name == "scheduler":
+            (component_dir / "scheduler_config.json").write_text("{}")
+        else:
+            (component_dir / "config.json").write_text("{}")
+            (component_dir / "model.safetensors").write_bytes(b"weights")
 
     validated_roots = []
 
@@ -105,3 +170,24 @@ def test_preflight_checks_model_layout_data_and_four_bf16_gpus(tmp_path, monkeyp
     training_script.run_preflight(config, torch_module=SimpleNamespace(cuda=FakeCuda()))
 
     assert validated_roots == [("/data/simgen", tuple(range(128)))]
+
+
+def test_preflight_rejects_empty_model_component_with_missing_artifact(tmp_path):
+    import pytest
+
+    training_script = _training_script_module()
+    aether_model = tmp_path / "AetherV1"
+    cogvideox_model = tmp_path / "CogVideoX-5b-I2V"
+    (aether_model / "transformer").mkdir(parents=True)
+    for name in ("tokenizer", "text_encoder", "vae", "scheduler"):
+        (cogvideox_model / name).mkdir(parents=True)
+
+    config = SimpleNamespace(
+        aether_model_id=str(aether_model),
+        cogvideox_model_id=str(cogvideox_model),
+        data_root="/data/simgen",
+        sample_ids=tuple(range(128)),
+    )
+
+    with pytest.raises(FileNotFoundError, match="transformer/config.json"):
+        training_script.validate_local_model_files(config)

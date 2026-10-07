@@ -64,6 +64,7 @@ def sample_aether_latents(
     ofs: torch.Tensor | None,
     seed: int = 42,
     num_inference_steps: int = 50,
+    show_progress: bool = False,
 ) -> torch.Tensor:
     """Denoise a fixed-seed Aether target state with four-history conditions.
 
@@ -81,7 +82,14 @@ def sample_aether_latents(
     latents = latents * scheduler.init_noise_sigma
     scheduler.set_timesteps(num_inference_steps, device=latents.device)
     old_prediction = None
-    for index, timestep in enumerate(scheduler.timesteps):
+    from tqdm.auto import tqdm
+    timesteps = tqdm(
+        scheduler.timesteps,
+        desc="Aether rollout",
+        unit="step",
+        disable=not show_progress,
+    )
+    for index, timestep in enumerate(timesteps):
         model_input = scheduler.scale_model_input(torch.cat((latents, latents)), timestep)
         latent_conditions = torch.cat(
             (unconditional_conditions(condition_latents), condition_latents)

@@ -147,14 +147,15 @@ dmypy.json
 # Lightning-Hydra-Template
 configs/local/default.yaml
 # data/
-/logs/
+/logs/*
 .env
 
 # Aim logging
 .aim
 
 # local files
-logs
+/logs/*
+!/logs/.gitkeep
 .gradio_cache
 outputs
 eval_results/

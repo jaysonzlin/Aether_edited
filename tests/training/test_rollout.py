@@ -81,7 +81,17 @@ def test_rollout_requires_exactly_41_decoded_frames():
         raise AssertionError("expected a non-41 decoded clip to fail")
 
 
-def test_sampler_clones_the_scheduler_and_uses_seeded_aether_cfg_inputs():
+def test_sampler_clones_scheduler_and_progress_is_opt_in(monkeypatch):
+    import tqdm.auto
+
+    progress_states = []
+    real_tqdm = tqdm.auto.tqdm
+
+    def tracking_tqdm(iterable, **kwargs):
+        progress_states.append(kwargs["disable"])
+        return real_tqdm(iterable, disable=True)
+
+    monkeypatch.setattr(tqdm.auto, "tqdm", tracking_tqdm)
     scheduler = FakeScheduler()
     transformer = FakeTransformer()
     conditions = torch.ones((1, 11, 40, 60, 90))
@@ -96,6 +106,7 @@ def test_sampler_clones_the_scheduler_and_uses_seeded_aether_cfg_inputs():
         ofs=None,
         seed=42,
         num_inference_steps=2,
+        show_progress=False,
     )
     second = sample_aether_latents(
         FakeTransformer(),
@@ -106,9 +117,11 @@ def test_sampler_clones_the_scheduler_and_uses_seeded_aether_cfg_inputs():
         ofs=None,
         seed=42,
         num_inference_steps=2,
+        show_progress=True,
     )
 
     assert torch.equal(first, second)
+    assert progress_states == [True, False]
     assert torch.equal(scheduler.timesteps, torch.tensor([99]))
     call = transformer.calls[0]
     assert call["hidden_states"].shape == (2, 11, 96, 60, 90)
