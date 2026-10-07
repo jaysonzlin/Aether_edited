@@ -14,6 +14,9 @@ from aether.training.config import load_training_config
 from aether.training.simgen_dataset import SimGenFixedViewDataset
 
 
+FIXED_VIEW_ROLLOUT_FPS = 12
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -115,6 +118,110 @@ def has_remaining_steps(completed_steps: int, max_train_steps: int) -> bool:
     return completed_steps < max_train_steps
 
 
+def fixed_rollout_batch(dataset, device):
+    """Load the unshuffled fixed sample used for every qualitative preview."""
+    import torch
+
+    try:
+        sample_index = tuple(dataset.sample_ids).index(0)
+    except ValueError as error:
+        raise ValueError("fixed rollout requires sample_0 in the training dataset") from error
+    sample = dataset[sample_index]
+    return {
+        key: torch.as_tensor(sample[key], device=device).unsqueeze(0)
+        for key in ("rgb", "disparity", "raymap")
+    }
+
+
+def _decoded_rgb_batch(decoded_video):
+    """Normalize CogVideoX postprocessed video to [batch, frames, channels, H, W]."""
+    import torch
+
+    decoded = torch.as_tensor(decoded_video)
+    if decoded.ndim != 5 or decoded.shape[-1] != 3:
+        raise ValueError("CogVideoX decode must have shape [batch, frames, height, width, 3]")
+    return decoded.permute(0, 1, 4, 2, 3)
+
+
+def save_fixed_rollout_artifacts(
+    *,
+    accelerator,
+    config,
+    dataset,
+    pipeline,
+    transformer,
+    vae,
+    scheduler,
+    prompt_embeds,
+    global_step: int,
+) -> tuple[Path, Path]:
+    """Generate rank-zero's deterministic fixed-sample target and rollout MP4s."""
+    import torch
+
+    from aether.training.aether_latents import assemble_aether_training_batch
+    from aether.training.rollout import (
+        composite_history,
+        require_41_frames,
+        sample_aether_latents,
+    )
+    from aether.training.visualization import save_fixed_rollout
+
+    fixed_batch = fixed_rollout_batch(dataset, accelerator.device)
+    cuda_devices = [accelerator.device.index or 0] if accelerator.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(config.seed)
+        if accelerator.device.type == "cuda":
+            torch.cuda.manual_seed(config.seed)
+        assembled = assemble_aether_training_batch(fixed_batch, vae, config.history_slots)
+
+    rollout_model = accelerator.unwrap_model(transformer)
+    was_training = rollout_model.training
+    rollout_model.eval()
+    try:
+        rotary_emb = (
+            pipeline._prepare_rotary_positional_embeddings(
+                config.height,
+                config.width,
+                assembled.target_latents.shape[1],
+                accelerator.device,
+                fps=FIXED_VIEW_ROLLOUT_FPS,
+            )
+            if rollout_model.config.use_rotary_positional_embeddings
+            else None
+        )
+        ofs = (
+            None
+            if rollout_model.config.ofs_embed_dim is None
+            else assembled.target_latents.new_full((1,), 2.0)
+        )
+        rollout_latents = sample_aether_latents(
+            rollout_model,
+            scheduler,
+            assembled.condition_latents,
+            prompt_embeds,
+            rotary_emb,
+            ofs,
+            seed=config.seed,
+            num_inference_steps=50,
+        )
+        rgb_latents = rollout_latents[:, :, :16]
+        decoded_rgb = pipeline.video_processor.postprocess_video(
+            video=pipeline.decode_latents(rgb_latents), output_type="np"
+        )
+        generated_rgb = _decoded_rgb_batch(decoded_rgb).to(fixed_batch["rgb"].device)
+        require_41_frames(generated_rgb)
+        generated_rgb = composite_history(generated_rgb, fixed_batch["rgb"], history_frames=13)
+        return save_fixed_rollout(
+            config.output_dir,
+            global_step,
+            target_rgb=fixed_batch["rgb"][0].permute(0, 2, 3, 1).cpu().numpy(),
+            generated_rgb=generated_rgb[0].permute(0, 2, 3, 1).cpu().numpy(),
+            fps=FIXED_VIEW_ROLLOUT_FPS,
+        )
+    finally:
+        rollout_model.train(was_training)
+
+
 def run_training(config, gpu_smoke_test: bool = False, resume: str | None = "latest") -> None:
     import torch
     import torch.nn.functional as functional
@@ -213,9 +320,26 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = "lat
         if accelerator.sync_gradients and accelerator.is_main_process:
             accelerator.print(f"step={global_step} stage1_mse={loss.item():.6f}")
         if accelerator.sync_gradients and global_step % config.output_interval == 0:
-            checkpoint = save_checkpoint(accelerator, config.output_dir, global_step)
+            checkpoint = save_checkpoint(
+                accelerator, config.output_dir, global_step, keep_last=2
+            )
             if accelerator.is_main_process:
                 accelerator.print(f"saved checkpoint: {checkpoint}")
+                target_path, generated_path = save_fixed_rollout_artifacts(
+                    accelerator=accelerator,
+                    config=config,
+                    dataset=dataset,
+                    pipeline=pipeline,
+                    transformer=transformer,
+                    vae=vae,
+                    scheduler=scheduler,
+                    prompt_embeds=prompt_embeds,
+                    global_step=global_step,
+                )
+                accelerator.print(
+                    f"saved fixed rollout: target={target_path} generated={generated_path}"
+                )
+            accelerator.wait_for_everyone()
         if global_step >= max_train_steps:
             break
     if gpu_smoke_test:
