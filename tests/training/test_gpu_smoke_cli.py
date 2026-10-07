@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -64,3 +65,43 @@ def test_fixed_rollout_batch_uses_sample_zero_without_dataloader_shuffle():
     assert set(batch) == {"rgb", "disparity", "raymap"}
     assert batch["rgb"].shape == (1, 41, 3, 480, 720)
     assert batch["raymap"].shape == (1, 11, 24, 60, 90)
+
+
+def test_preflight_checks_model_layout_data_and_four_bf16_gpus(tmp_path, monkeypatch):
+    training_script = _training_script_module()
+    aether_model = tmp_path / "AetherV1"
+    cogvideox_model = tmp_path / "CogVideoX-5b-I2V"
+    (aether_model / "transformer").mkdir(parents=True)
+    for name in ("tokenizer", "text_encoder", "vae", "scheduler"):
+        (cogvideox_model / name).mkdir(parents=True)
+
+    validated_roots = []
+
+    class Dataset:
+        def __init__(self, root, sample_ids):
+            validated_roots.append((root, sample_ids))
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 4
+
+        @staticmethod
+        def is_bf16_supported():
+            return True
+
+    monkeypatch.setattr(training_script, "SimGenFixedViewDataset", Dataset)
+    config = SimpleNamespace(
+        aether_model_id=str(aether_model),
+        cogvideox_model_id=str(cogvideox_model),
+        data_root="/data/simgen",
+        sample_ids=tuple(range(128)),
+    )
+
+    training_script.run_preflight(config, torch_module=SimpleNamespace(cuda=FakeCuda()))
+
+    assert validated_roots == [("/data/simgen", tuple(range(128)))]

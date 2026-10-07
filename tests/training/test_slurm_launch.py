@@ -13,6 +13,7 @@ def test_four_h200_mamba_launcher_uses_local_models_and_automatic_resume():
     assert "--resume latest" in contents
     assert "aether_model_id=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/models/AetherV1" in contents
     assert "cogvideox_model_id=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/models/CogVideoX-5b-I2V" in contents
+    assert "scripts/train_fixed_view_simgen.py --preflight" in contents
 
 
 def test_accelerate_config_is_one_machine_four_gpu_bf16_ddp():

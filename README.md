@@ -79,6 +79,9 @@ Use `--override aether_model_id=/path/to/AetherV1` or
 `--override cogvideox_model_id=/path/to/CogVideoX-5b-I2V` when the snapshots
 live elsewhere.
 
+For the four-H200 preflight, Slurm/Mamba launch command, checkpoint behavior,
+and fixed-rollout MP4 contract, see [the fixed-view training guide](docs/fixed_view_simgen_training.md).
+
 ## :rocket: Inference
 
 > ***Warning***: When doing reconstruction, Aether pipeline automatically centers crop the input video if its size does not match 480x720. 

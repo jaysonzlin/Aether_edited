@@ -83,6 +83,10 @@ assert torch.cuda.device_count() == 4
 print(f"torch={torch.__version__} cuda={torch.version.cuda} gpus={torch.cuda.device_count()}")
 '
 
+"${PYTHON_BIN}" scripts/train_fixed_view_simgen.py --preflight \
+    --override aether_model_id=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/models/AetherV1 \
+    --override cogvideox_model_id=/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited/models/CogVideoX-5b-I2V
+
 exec "${ACCELERATE_BIN}" launch \
     --config_file configs/accelerate/h200_4gpu.yaml \
     scripts/train_fixed_view_simgen.py \

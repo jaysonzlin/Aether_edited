@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         help="Load configured weights and data, run one real CUDA optimizer step, then exit.",
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Validate data, local model layout, and four-GPU bf16 readiness without training.",
+    )
+    parser.add_argument(
         "--resume",
         default="latest",
         help="Checkpoint directory to restore, or 'latest' to resume the newest output checkpoint.",
@@ -116,6 +121,29 @@ def training_steps(max_train_steps: int, gpu_smoke_test: bool) -> int:
 
 def has_remaining_steps(completed_steps: int, max_train_steps: int) -> bool:
     return completed_steps < max_train_steps
+
+
+def run_preflight(config, torch_module=None) -> None:
+    """Reject a cluster allocation that cannot run the fixed four-H200 job."""
+    if torch_module is None:
+        import torch as torch_module
+
+    required_model_paths = (
+        Path(config.aether_model_id) / "transformer",
+        *(Path(config.cogvideox_model_id) / name for name in ("tokenizer", "text_encoder", "vae", "scheduler")),
+    )
+    missing = [str(path) for path in required_model_paths if not path.is_dir()]
+    if missing:
+        raise FileNotFoundError("missing required local model directories: " + ", ".join(missing))
+
+    SimGenFixedViewDataset(config.data_root, config.sample_ids)
+    if not torch_module.cuda.is_available():
+        raise RuntimeError("preflight requires CUDA")
+    if torch_module.cuda.device_count() != 4:
+        raise RuntimeError("preflight requires exactly four visible GPUs")
+    if not torch_module.cuda.is_bf16_supported():
+        raise RuntimeError("preflight requires CUDA bf16 support")
+    print("preflight passed: data, local model layout, four GPUs, and bf16 are ready")
 
 
 def fixed_rollout_batch(dataset, device):
@@ -352,6 +380,9 @@ def main() -> None:
     if args.dry_run:
         dataset = SimGenFixedViewDataset(config.data_root, config.sample_ids)
         print(f"validated {len(dataset)} fixed-view SimGen samples")
+        return
+    if args.preflight:
+        run_preflight(config)
         return
     if args.smoke_test:
         _run_smoke_test()
