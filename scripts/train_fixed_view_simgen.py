@@ -17,6 +17,16 @@ from aether.training.simgen_dataset import SimGenFixedViewDataset
 FIXED_VIEW_ROLLOUT_FPS = 12
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -43,7 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-smoke-test",
         action="store_true",
-        help="Load configured weights and data, run one real CUDA optimizer step, then exit.",
+        help="Load configured weights and data, run a real CUDA optimizer smoke test, then exit.",
+    )
+    parser.add_argument(
+        "--gpu-smoke-test-steps",
+        type=_positive_int,
+        default=None,
+        help="Optimizer updates for --gpu-smoke-test (default: 1).",
     )
     parser.add_argument(
         "--preflight",
@@ -114,9 +130,24 @@ def _infinite_batches(dataloader):
         yield from dataloader
 
 
-def training_steps(max_train_steps: int, gpu_smoke_test: bool) -> int:
+def training_steps(
+    max_train_steps: int,
+    gpu_smoke_test: bool,
+    gpu_smoke_test_steps: int = 1,
+) -> int:
     """Keep the saved run configuration intact while capping GPU smoke mode."""
-    return 1 if gpu_smoke_test else max_train_steps
+    if not gpu_smoke_test:
+        return max_train_steps
+    if gpu_smoke_test_steps <= 0:
+        raise ValueError("gpu_smoke_test_steps must be positive")
+    return min(gpu_smoke_test_steps, max_train_steps)
+
+
+def validate_gpu_smoke_test_args(args: argparse.Namespace) -> None:
+    if args.gpu_smoke_test_steps is not None and not args.gpu_smoke_test:
+        raise SystemExit("--gpu-smoke-test-steps requires --gpu-smoke-test")
+    if args.gpu_smoke_test and args.resume is not None:
+        raise SystemExit("--gpu-smoke-test cannot be combined with --resume")
 
 
 def diffusion_training_target(scheduler, target_latents, noise, timesteps):
@@ -130,6 +161,36 @@ def diffusion_training_target(scheduler, target_latents, noise, timesteps):
         "unsupported scheduler prediction_type "
         f"{prediction_type!r}; expected 'epsilon' or 'v_prediction'"
     )
+
+
+def component_training_losses(prediction, target):
+    """Report detached per-element MSEs for Aether's RGB-D and raymap outputs."""
+    import torch.nn.functional as functional
+
+    from aether.training.aether_latents import RGB_LATENT_CHANNELS, RAYMAP_CHANNELS
+
+    if prediction.shape != target.shape or prediction.ndim != 5:
+        raise ValueError("prediction and target must have matching [batch, frames, channels, height, width] shapes")
+    disparity_start = RGB_LATENT_CHANNELS
+    raymap_start = RGB_LATENT_CHANNELS * 2
+    expected_channels = raymap_start + RAYMAP_CHANNELS
+    if prediction.shape[2] != expected_channels:
+        raise ValueError(f"expected {expected_channels} output channels, got {prediction.shape[2]}")
+
+    prediction = prediction.detach().float()
+    target = target.detach().float()
+    return {
+        "train/rgb_loss": functional.mse_loss(
+            prediction[:, :, :disparity_start], target[:, :, :disparity_start]
+        ),
+        "train/disparity_loss": functional.mse_loss(
+            prediction[:, :, disparity_start:raymap_start],
+            target[:, :, disparity_start:raymap_start],
+        ),
+        "train/raymap_loss": functional.mse_loss(
+            prediction[:, :, raymap_start:], target[:, :, raymap_start:]
+        ),
+    }
 
 
 def build_optimizer(transformer, config, torch_module=None):
@@ -409,7 +470,12 @@ def save_fixed_rollout_artifacts(
         rollout_model.train(was_training)
 
 
-def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None) -> None:
+def run_training(
+    config,
+    gpu_smoke_test: bool = False,
+    resume: str | None = None,
+    gpu_smoke_test_steps: int = 1,
+) -> None:
     import torch
     import torch.nn.functional as functional
     from accelerate import Accelerator
@@ -440,7 +506,9 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None
     if gpu_smoke_test and (not torch.cuda.is_available() or accelerator.device.type != "cuda"):
         raise RuntimeError("--gpu-smoke-test requires an available CUDA GPU")
     torch.manual_seed(config.seed)
-    max_train_steps = training_steps(config.max_train_steps, gpu_smoke_test)
+    max_train_steps = training_steps(
+        config.max_train_steps, gpu_smoke_test, gpu_smoke_test_steps
+    )
     dataset = SimGenFixedViewDataset(config.data_root, config.sample_ids)
     dataloader = DataLoader(
         dataset,
@@ -530,6 +598,7 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None
                     scheduler, target_latents, noise, timesteps
                 )
                 loss = functional.mse_loss(prediction.float(), training_target.float())
+                component_losses = component_training_losses(prediction, training_target)
                 if not torch.isfinite(loss):
                     raise RuntimeError("Stage-1 loss became non-finite")
                 accelerator.backward(loss)
@@ -554,10 +623,16 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None
                     if grad_norm is not None
                     else 0.0
                 )
+                component_loss_values = {
+                    name: float(value.item()) for name, value in component_losses.items()
+                }
                 if accelerator.is_main_process:
                     progress.update(1)
                     progress.set_postfix(
                         loss=f"{loss.item():.5f}",
+                        rgb=f"{component_loss_values['train/rgb_loss']:.5f}",
+                        disparity=f"{component_loss_values['train/disparity_loss']:.5f}",
+                        raymap=f"{component_loss_values['train/raymap_loss']:.5f}",
                         lr=f"{learning_rate:.2e}",
                         grad_norm=f"{grad_norm_value:.3f}",
                     )
@@ -565,8 +640,9 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None
                     accelerator.log(
                         {
                             "train/loss": float(loss.detach().float().item()),
-                            "train/learning_rate": float(learning_rate),
-                            "train/grad_norm": grad_norm_value,
+                        "train/learning_rate": float(learning_rate),
+                        "train/grad_norm": grad_norm_value,
+                        **component_loss_values,
                         },
                         step=global_step,
                     )
@@ -603,11 +679,15 @@ def run_training(config, gpu_smoke_test: bool = False, resume: str | None = None
         if config.report_to:
             accelerator.end_training()
     if gpu_smoke_test:
-        accelerator.print("GPU smoke test passed: one finite Stage-1 optimizer step completed")
+        accelerator.print(
+            "GPU smoke test passed: "
+            f"{max_train_steps} finite Stage-1 optimizer update(s) completed"
+        )
 
 
 def main() -> None:
     args = parse_args()
+    validate_gpu_smoke_test_args(args)
     config = load_training_config(args.config, args.override)
     if args.dry_run:
         dataset = SimGenFixedViewDataset(config.data_root, config.sample_ids)
@@ -619,9 +699,12 @@ def main() -> None:
     if args.smoke_test:
         _run_smoke_test()
         return
-    if args.gpu_smoke_test and args.resume is not None:
-        raise SystemExit("--gpu-smoke-test cannot be combined with --resume")
-    run_training(config, gpu_smoke_test=args.gpu_smoke_test, resume=args.resume)
+    run_training(
+        config,
+        gpu_smoke_test=args.gpu_smoke_test,
+        resume=args.resume,
+        gpu_smoke_test_steps=args.gpu_smoke_test_steps or 1,
+    )
 
 
 if __name__ == "__main__":

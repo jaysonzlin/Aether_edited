@@ -46,6 +46,30 @@ def test_unsupported_scheduler_prediction_type_fails_explicitly():
         diffusion_training_target(scheduler, object(), object(), object())
 
 
+def test_component_losses_split_rgb_disparity_and_raymap_output_channels():
+    import torch
+    from scripts.train_fixed_view_simgen import component_training_losses
+
+    prediction = torch.zeros((1, 2, 56, 1, 1))
+    prediction[:, :, :16] = 1.0
+    prediction[:, :, 16:32] = 2.0
+    prediction[:, :, 32:] = 3.0
+    target = torch.zeros_like(prediction)
+
+    losses = component_training_losses(prediction, target)
+
+    assert set(losses) == {"train/rgb_loss", "train/disparity_loss", "train/raymap_loss"}
+    assert losses["train/rgb_loss"].item() == 1.0
+    assert losses["train/disparity_loss"].item() == 4.0
+    assert losses["train/raymap_loss"].item() == 9.0
+    weighted_mean = (
+        losses["train/rgb_loss"] * 16
+        + losses["train/disparity_loss"] * 16
+        + losses["train/raymap_loss"] * 24
+    ) / 56
+    torch.testing.assert_close(weighted_mean, torch.nn.functional.mse_loss(prediction, target))
+
+
 def test_run_manifest_is_computed_once_on_rank_zero_and_broadcast(monkeypatch):
     import aether.training.checkpointing as checkpointing
     from scripts.train_fixed_view_simgen import shared_run_manifest

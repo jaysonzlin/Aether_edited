@@ -79,3 +79,15 @@ the newest two numbered directories. Every 1,000 steps it additionally writes
 both `step_<step>_target.mp4` and `step_<step>_generated.mp4`. The generated
 MP4 is a real 50-step Aether DPM rollout of `sample_0` at seed 42; its first
 13 raw RGB frames are replaced with the observed history for visual alignment.
+
+## Training metrics
+
+With W&B enabled, the trainer logs `train/loss`, `train/learning_rate`,
+`train/grad_norm`, and per-output-slice losses: `train/rgb_loss`,
+`train/disparity_loss`, and `train/raymap_loss`. These are per-element MSEs
+against the same scheduler-derived diffusion target, split across the 16 RGB,
+16 normalized-disparity, and 24 raymap latent output channels. They are
+diagnostics, not separately weighted objectives; `train/loss` remains the
+single optimization objective and equals the channel-count-weighted mean of
+the three component losses. The disparity metric is latent-space diffusion
+loss, not pixel-space or metric-depth error. No PC predictor loss is included.

@@ -29,6 +29,49 @@ def test_gpu_smoke_mode_runs_exactly_one_optimizer_step(monkeypatch):
     assert training_script.training_steps(10_000, gpu_smoke_test=True) == 1
 
 
+def test_gpu_smoke_mode_accepts_an_explicit_two_step_limit(monkeypatch):
+    training_script = _training_script_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_fixed_view_simgen.py", "--gpu-smoke-test", "--gpu-smoke-test-steps", "2"],
+    )
+
+    args = training_script.parse_args()
+
+    assert args.gpu_smoke_test_steps == 2
+    assert training_script.training_steps(10_000, True, args.gpu_smoke_test_steps) == 2
+
+
+def test_gpu_smoke_step_limit_must_be_positive(monkeypatch):
+    import pytest
+
+    training_script = _training_script_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_fixed_view_simgen.py", "--gpu-smoke-test", "--gpu-smoke-test-steps", "0"],
+    )
+
+    with pytest.raises(SystemExit):
+        training_script.parse_args()
+
+
+def test_explicit_gpu_smoke_step_limit_requires_gpu_smoke_mode():
+    import pytest
+
+    from scripts.train_fixed_view_simgen import validate_gpu_smoke_test_args
+
+    args = SimpleNamespace(
+        gpu_smoke_test=False,
+        gpu_smoke_test_steps=2,
+        resume=None,
+    )
+
+    with pytest.raises(SystemExit, match="requires --gpu-smoke-test"):
+        validate_gpu_smoke_test_args(args)
+
+
 def test_training_leaves_resume_unset_for_context_sensitive_default(monkeypatch):
     training_script = _training_script_module()
     monkeypatch.setattr(sys, "argv", ["train_fixed_view_simgen.py"])
