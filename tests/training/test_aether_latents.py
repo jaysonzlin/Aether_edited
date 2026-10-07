@@ -5,11 +5,12 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch
 
-from aether.training.aether_latents import assemble_aether_training_batch
+from aether.training.aether_latents import _encode_video, assemble_aether_training_batch
 
 
 class FakeVAE:
     config = SimpleNamespace(scaling_factor=0.5, invert_scale_latents=False)
+    dtype = torch.float32
 
     def __init__(self):
         self.inputs = []
@@ -21,6 +22,21 @@ class FakeVAE:
             (video.shape[0], 16, 11, 60, 90), value, dtype=video.dtype
         )
         return SimpleNamespace(latents=latents)
+
+
+class BF16ConvolutionVAE(torch.nn.Module):
+    """Small real convolution boundary matching the frozen CogVideoX VAE."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = torch.nn.Conv3d(3, 16, kernel_size=1, dtype=torch.bfloat16)
+
+    @property
+    def dtype(self):
+        return self.encoder.weight.dtype
+
+    def encode(self, video):
+        return SimpleNamespace(latents=self.encoder(video))
 
 
 def test_assembly_preserves_aether_modality_order_and_four_latent_history():
@@ -54,3 +70,13 @@ def test_assembly_converts_rgb_to_vae_range_but_keeps_normalized_disparity():
 
     torch.testing.assert_close(vae.inputs[0], torch.full((1, 3, 41, 480, 720), -0.5))
     torch.testing.assert_close(vae.inputs[1], disparity.permute(0, 2, 1, 3, 4))
+
+
+def test_encode_video_casts_float32_frames_to_the_frozen_vae_dtype():
+    vae = BF16ConvolutionVAE()
+    video = torch.zeros((1, 5, 3, 2, 2), dtype=torch.float32)
+
+    latents = _encode_video(vae, video)
+
+    assert latents.dtype is torch.bfloat16
+    assert latents.shape == (1, 5, 16, 2, 2)

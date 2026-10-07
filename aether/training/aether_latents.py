@@ -17,6 +17,7 @@ class VAEEncoder(Protocol):
     """The minimal CogVideoX VAE interface used by latent assembly."""
 
     config: Any
+    dtype: torch.dtype
 
     def encode(self, video: torch.Tensor) -> Any: ...
 
@@ -41,6 +42,7 @@ def _retrieve_latents(encoder_output: Any) -> torch.Tensor:
 @torch.no_grad()
 def _encode_video(vae: VAEEncoder, video: torch.Tensor) -> torch.Tensor:
     """Encode ``[batch, frames, channels, height, width]`` into Aether layout."""
+    video = video.to(dtype=vae.dtype)
     encoded = _retrieve_latents(vae.encode(video.permute(0, 2, 1, 3, 4)))
     if encoded.ndim != 5:
         raise ValueError("VAE latents must have shape [batch, channels, frames, height, width]")
