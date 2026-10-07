@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load configured weights and data, run one real CUDA optimizer step, then exit.",
     )
+    parser.add_argument(
+        "--resume",
+        default="latest",
+        help="Checkpoint directory to restore, or 'latest' to resume the newest output checkpoint.",
+    )
     return parser.parse_args()
 
 
@@ -106,13 +111,22 @@ def training_steps(max_train_steps: int, gpu_smoke_test: bool) -> int:
     return 1 if gpu_smoke_test else max_train_steps
 
 
-def run_training(config, gpu_smoke_test: bool = False) -> None:
+def has_remaining_steps(completed_steps: int, max_train_steps: int) -> bool:
+    return completed_steps < max_train_steps
+
+
+def run_training(config, gpu_smoke_test: bool = False, resume: str | None = "latest") -> None:
     import torch
     import torch.nn.functional as functional
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
 
     from aether.training.aether_latents import assemble_aether_training_batch
+    from aether.training.checkpointing import (
+        latest_checkpoint,
+        restore_checkpoint,
+        save_checkpoint,
+    )
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
@@ -132,8 +146,23 @@ def run_training(config, gpu_smoke_test: bool = False) -> None:
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=config.learning_rate)
     transformer, optimizer, dataloader = accelerator.prepare(transformer, optimizer, dataloader)
     transformer.train()
+    if resume == "latest":
+        checkpoint = latest_checkpoint(config.output_dir)
+    elif resume:
+        checkpoint = Path(resume)
+    else:
+        checkpoint = None
+    completed_steps = 0
+    if checkpoint is not None:
+        completed_steps = restore_checkpoint(accelerator, checkpoint)
+        accelerator.print(f"resumed checkpoint {checkpoint} at step {completed_steps}")
+    if not has_remaining_steps(completed_steps, max_train_steps):
+        accelerator.print(f"training already completed at step {completed_steps}")
+        return
 
-    for global_step, batch in enumerate(_infinite_batches(dataloader), start=1):
+    for global_step, batch in enumerate(
+        _infinite_batches(dataloader), start=completed_steps + 1
+    ):
         with accelerator.accumulate(transformer):
             model_batch = {
                 key: value.to(accelerator.device)
@@ -183,6 +212,10 @@ def run_training(config, gpu_smoke_test: bool = False) -> None:
 
         if accelerator.sync_gradients and accelerator.is_main_process:
             accelerator.print(f"step={global_step} stage1_mse={loss.item():.6f}")
+        if accelerator.sync_gradients and global_step % config.output_interval == 0:
+            checkpoint = save_checkpoint(accelerator, config.output_dir, global_step)
+            if accelerator.is_main_process:
+                accelerator.print(f"saved checkpoint: {checkpoint}")
         if global_step >= max_train_steps:
             break
     if gpu_smoke_test:
@@ -199,7 +232,7 @@ def main() -> None:
     if args.smoke_test:
         _run_smoke_test()
         return
-    run_training(config, gpu_smoke_test=args.gpu_smoke_test)
+    run_training(config, gpu_smoke_test=args.gpu_smoke_test, resume=args.resume)
 
 
 if __name__ == "__main__":

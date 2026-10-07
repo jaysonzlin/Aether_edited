@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from aether.training.checkpointing import restore_checkpoint, save_checkpoint
+from aether.training.checkpointing import (
+    latest_checkpoint,
+    restore_checkpoint,
+    save_checkpoint,
+)
 
 
 class FakeAccelerator:
@@ -34,3 +38,12 @@ def test_checkpoint_retention_keeps_the_most_recent_numbered_directories(tmp_pat
     assert not (tmp_path / "checkpoint-001000").exists()
     assert (tmp_path / "checkpoint-002000").exists()
     assert (tmp_path / "checkpoint-003000").exists()
+
+
+def test_latest_checkpoint_selects_the_highest_valid_step(tmp_path):
+    accelerator = FakeAccelerator()
+    save_checkpoint(accelerator, tmp_path, global_step=1_000)
+    save_checkpoint(accelerator, tmp_path, global_step=3_000)
+    (tmp_path / "checkpoint-999999").mkdir()
+
+    assert latest_checkpoint(tmp_path) == tmp_path / "checkpoint-003000"

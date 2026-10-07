@@ -33,6 +33,24 @@ def _trim_checkpoints(output_dir: Path, keep_last: int) -> None:
         shutil.rmtree(checkpoint)
 
 
+def latest_checkpoint(output_dir: str | Path) -> Path | None:
+    """Return the newest checkpoint with valid global-step metadata."""
+    output_path = Path(output_dir)
+    checkpoints = sorted(
+        (path for path in output_path.glob("checkpoint-*") if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for checkpoint in checkpoints:
+        try:
+            metadata = json.loads((checkpoint / "metadata.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata.get("global_step"), int) and metadata["global_step"] > 0:
+            return checkpoint
+    return None
+
+
 def save_checkpoint(
     accelerator: AcceleratorState,
     output_dir: str | Path,
@@ -46,8 +64,16 @@ def save_checkpoint(
     if checkpoint.exists():
         raise FileExistsError(f"checkpoint already exists and will not be overwritten: {checkpoint}")
     accelerator.save_state(checkpoint)
-    (checkpoint / "metadata.json").write_text(json.dumps({"global_step": global_step}) + "\n")
-    _trim_checkpoints(output_path, keep_last)
+    wait_for_everyone = getattr(accelerator, "wait_for_everyone", None)
+    if wait_for_everyone is not None:
+        wait_for_everyone()
+    if getattr(accelerator, "is_main_process", True):
+        (checkpoint / "metadata.json").write_text(
+            json.dumps({"global_step": global_step}) + "\n"
+        )
+        _trim_checkpoints(output_path, keep_last)
+    if wait_for_everyone is not None:
+        wait_for_everyone()
     return checkpoint
 
 
