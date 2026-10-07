@@ -14,5 +14,5 @@ train_batch_size: 1
 gradient_accumulation_steps: 1
 seed: 42
 output_dir: outputs/fixed_view_simgen
-aether_model_id: AetherWorldModel/AetherV1
-cogvideox_model_id: THUDM/CogVideoX-5b-I2V
+aether_model_id: models/AetherV1
+cogvideox_model_id: models/CogVideoX-5b-I2V

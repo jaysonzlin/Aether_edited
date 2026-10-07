@@ -19,6 +19,8 @@ def test_first_run_config_has_the_agreed_fixed_view_constants():
     assert config.output_interval == 1_000
     assert config.mixed_precision == "bf16"
     assert config.sample_ids == tuple(range(128))
+    assert config.cogvideox_model_id == "models/CogVideoX-5b-I2V"
+    assert config.aether_model_id == "models/AetherV1"
 
 
 def test_config_rejects_incompatible_temporal_or_padding_values(tmp_path):

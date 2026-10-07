@@ -51,6 +51,34 @@ conda activate aether
 pip install -r requirements.txt
 ```
 
+## Fixed-view SimGen training
+
+The fixed-view training configuration uses local model snapshots by default,
+so training does not download model weights into the Hugging Face cache. Place
+the complete snapshots in the following layout relative to the repository root:
+
+```text
+models/
+├── AetherV1/
+│   └── transformer/
+└── CogVideoX-5b-I2V/
+    ├── tokenizer/
+    ├── text_encoder/
+    ├── vae/
+    └── scheduler/
+```
+
+Then run the one-step GPU validation from the repository root:
+
+```console
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 \
+  scripts/train_fixed_view_simgen.py --gpu-smoke-test
+```
+
+Use `--override aether_model_id=/path/to/AetherV1` or
+`--override cogvideox_model_id=/path/to/CogVideoX-5b-I2V` when the snapshots
+live elsewhere.
+
 ## :rocket: Inference
 
 > ***Warning***: When doing reconstruction, Aether pipeline automatically centers crop the input video if its size does not match 480x720. 
