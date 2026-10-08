@@ -20,6 +20,7 @@ PYTHON_BIN="${MAMBA_ENV_PREFIX}/bin/python"
 ACCELERATE_BIN="${MAMBA_ENV_PREFIX}/bin/accelerate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1
 cd "${PROJECT_DIR}"
+export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 "${PYTHON_BIN}" scripts/train_fixed_view_simgen_stage2.py --preflight \
   --override aether_model_id="${PROJECT_DIR}/models/AetherV1" \
   --override cogvideox_model_id="${PROJECT_DIR}/models/CogVideoX-5b-I2V" \
