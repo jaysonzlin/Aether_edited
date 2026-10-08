@@ -120,11 +120,10 @@ def main():
                         save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
                 if step >= (1 if args.gpu_smoke_test else config.max_train_steps):
                     if args.gpu_smoke_test:
-                        if accelerator.is_main_process:
-                            print(
-                                smoke_result_message(step, float(total.detach().float().item())),
-                                flush=True,
-                            )
+                        print(
+                            smoke_result_message(step, float(total.detach().float().item())),
+                            flush=True,
+                        )
                     return
 
 
