@@ -2,12 +2,50 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from aether.training.checkpointing import (
     latest_checkpoint,
     build_run_manifest,
     restore_checkpoint,
     save_checkpoint,
 )
+
+
+def test_stage1_transformer_loader_requires_completed_checkpoint_and_loads_weights(tmp_path):
+    import aether.training.checkpointing as checkpointing
+
+    checkpoint = tmp_path / "checkpoint-010000"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text('{"global_step": 10000, "run_manifest": {}}')
+    (checkpoint / "model.safetensors").touch()
+
+    class Target:
+        def __init__(self):
+            self.received = None
+
+        def load_state_dict(self, state_dict, strict):
+            self.received = (state_dict, strict)
+            return [], []
+
+    target = Target()
+    checkpointing._load_safetensor_state = lambda _: {"weight": "source"}
+
+    checkpointing.load_stage1_transformer_weights(target, checkpoint)
+
+    assert target.received == ({"weight": "source"}, True)
+
+
+def test_stage1_transformer_loader_rejects_incomplete_or_wrong_step_checkpoint(tmp_path):
+    from aether.training.checkpointing import load_stage1_transformer_weights
+
+    checkpoint = tmp_path / "checkpoint-010000"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text('{"global_step": 9999, "run_manifest": {}}')
+    (checkpoint / "model.safetensors").touch()
+
+    with pytest.raises(ValueError, match="10000"):
+        load_stage1_transformer_weights(object(), checkpoint)
 
 RUN_MANIFEST = {
     "schema_version": 2,

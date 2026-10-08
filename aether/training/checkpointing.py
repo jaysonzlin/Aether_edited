@@ -17,6 +17,40 @@ class AcceleratorState(Protocol):
     def load_state(self, input_dir: str | Path) -> None: ...
 
 
+def _load_safetensor_state(path: Path):
+    """Load tensors lazily so metadata-only utilities do not import torch."""
+    from safetensors.torch import load_file
+
+    return load_file(str(path), device="cpu")
+
+
+def load_stage1_transformer_weights(transformer, checkpoint: str | Path) -> None:
+    """Import only a completed Stage-1 transformer, never its optimizer state."""
+    checkpoint_path = Path(checkpoint)
+    metadata_path = checkpoint_path / "metadata.json"
+    weights_path = checkpoint_path / "model.safetensors"
+    if checkpoint_path.name != "checkpoint-010000":
+        raise ValueError("Stage-2 requires the completed checkpoint-010000")
+    if not metadata_path.is_file() or not weights_path.is_file():
+        raise FileNotFoundError(
+            f"incomplete Stage-1 checkpoint: expected {metadata_path} and {weights_path}"
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid Stage-1 checkpoint metadata: {metadata_path}") from error
+    if metadata.get("global_step") != 10_000:
+        raise ValueError("Stage-2 requires a Stage-1 checkpoint saved at global step 10000")
+    incompatible = transformer.load_state_dict(_load_safetensor_state(weights_path), strict=True)
+    missing = list(getattr(incompatible, "missing_keys", ()))
+    unexpected = list(getattr(incompatible, "unexpected_keys", ()))
+    if missing or unexpected:
+        raise ValueError(
+            "Stage-1 transformer state is incompatible; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file_handle:
