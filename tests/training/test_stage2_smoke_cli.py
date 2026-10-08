@@ -1,5 +1,6 @@
 from scripts.train_fixed_view_simgen_stage2 import (
     enable_transformer_gradient_checkpointing,
+    enable_vae_gradient_checkpointing,
     smoke_result_message,
     smoke_trace_message,
 )
@@ -26,3 +27,18 @@ def test_stage2_enables_transformer_gradient_checkpointing_when_supported():
     enable_transformer_gradient_checkpointing(transformer)
 
     assert transformer.enabled
+
+
+def test_stage2_enables_frozen_vae_gradient_checkpointing_when_supported():
+    class Vae:
+        def __init__(self):
+            self.enabled = False
+
+        def enable_gradient_checkpointing(self):
+            self.enabled = True
+
+    vae = Vae()
+
+    enable_vae_gradient_checkpointing(vae)
+
+    assert vae.enabled

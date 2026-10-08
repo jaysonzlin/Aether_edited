@@ -38,6 +38,13 @@ def enable_transformer_gradient_checkpointing(transformer) -> None:
         enable()
 
 
+def enable_vae_gradient_checkpointing(vae) -> None:
+    """Checkpoint frozen VAE decoder activations while retaining image-loss gradients."""
+    enable = getattr(vae, "enable_gradient_checkpointing", None)
+    if callable(enable):
+        enable()
+
+
 def _weights(config, mse, losses, accelerator):
     from aether.training.stage2_losses import calibrate_auxiliary_weights
 
@@ -110,6 +117,8 @@ def main():
     trace("components loaded")
     enable_transformer_gradient_checkpointing(transformer)
     trace("gradient checkpointing enabled")
+    enable_vae_gradient_checkpointing(vae)
+    trace("VAE gradient checkpointing enabled")
     load_stage1_transformer_weights(transformer, config.stage1_checkpoint)
     trace("stage-1 transformer weights loaded")
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=config.learning_rate, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_epsilon, weight_decay=config.weight_decay)
