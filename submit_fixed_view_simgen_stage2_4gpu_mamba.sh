@@ -17,7 +17,6 @@ module load Mambaforge cuda/12.4.1 gcc/9.5.0-fasrc01
 PROJECT_DIR="${PROJECT_DIR:-/n/lab_storage/ydu_lab/jaysonzlin/Aether_edited}"
 MAMBA_ENV_PREFIX="${MAMBA_ENV_PREFIX:-/n/holylabs/ydu_lab/Lab/jaysonzlin/aether_env}"
 PYTHON_BIN="${MAMBA_ENV_PREFIX}/bin/python"
-ACCELERATE_BIN="${MAMBA_ENV_PREFIX}/bin/accelerate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1
 cd "${PROJECT_DIR}"
 export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -25,7 +24,7 @@ export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
   --override aether_model_id="${PROJECT_DIR}/models/AetherV1" \
   --override cogvideox_model_id="${PROJECT_DIR}/models/CogVideoX-5b-I2V" \
   --override stage1_checkpoint="${PROJECT_DIR}/outputs/fixed_view_simgen/checkpoint-010000"
-exec "${ACCELERATE_BIN}" launch --config_file configs/accelerate/h200_4gpu.yaml \
+exec "${PYTHON_BIN}" -m accelerate.commands.accelerate_cli launch --config_file configs/accelerate/h200_4gpu.yaml \
   scripts/train_fixed_view_simgen_stage2.py --resume latest \
   --override aether_model_id="${PROJECT_DIR}/models/AetherV1" \
   --override cogvideox_model_id="${PROJECT_DIR}/models/CogVideoX-5b-I2V" \
