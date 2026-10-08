@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
@@ -14,6 +15,7 @@ def parse_args():
     parser.add_argument("--resume", nargs="?", const="latest")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--gpu-smoke-test", action="store_true")
+    parser.add_argument("--trace-smoke-test", action="store_true")
     return parser.parse_args()
 
 
@@ -23,6 +25,10 @@ def _calibration_path(config):
 
 def smoke_result_message(step: int, loss: float) -> str:
     return f"Stage-2 GPU smoke test passed: completed {step} optimizer update (loss={loss:.6f})"
+
+
+def smoke_trace_message(boundary: str) -> str:
+    return f"Stage-2 GPU smoke trace: {boundary}"
 
 
 def _weights(config, mse, losses, accelerator):
@@ -65,6 +71,13 @@ def preflight(config):
 
 def main():
     args = parse_args()
+    trace_smoke = args.gpu_smoke_test and args.trace_smoke_test
+
+    def trace(boundary: str) -> None:
+        if trace_smoke:
+            print(smoke_trace_message(boundary), flush=True)
+
+    trace("arguments parsed")
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
     import torch
@@ -77,17 +90,23 @@ def main():
     from scripts.train_fixed_view_simgen import _load_training_components, accelerator_options, diffusion_training_target, optimizer_update, save_fixed_rollout_artifacts, unwrapped_transformer_config
 
     config = load_stage2_training_config(args.config, args.override)
+    trace("configuration loaded")
     if args.preflight:
         preflight(config)
         return
     accelerator = Accelerator(**accelerator_options(config))
+    trace("accelerator created")
     dataset = FixedViewSimGenDataset(config.data_root, config.sample_ids)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.dataloader_num_workers, pin_memory=config.pin_memory)
+    trace("dataset and dataloader created")
     pipeline, transformer, vae, scheduler, prompts = _load_training_components(config, accelerator)
+    trace("components loaded")
     load_stage1_transformer_weights(transformer, config.stage1_checkpoint)
+    trace("stage-1 transformer weights loaded")
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=config.learning_rate, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_epsilon, weight_decay=config.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.learning_rate, total_steps=config.max_train_steps, pct_start=config.onecycle_pct_start)
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(transformer, optimizer, dataloader, lr_scheduler)
+    trace("training state prepared")
     transformer_config = unwrapped_transformer_config(transformer, accelerator)
     manifest = {"schema_version": 1, "objective": "stage2_image_space_refinement", "stage1_checkpoint": str(config.stage1_checkpoint)}
     checkpoint = None if args.gpu_smoke_test else (latest_checkpoint(config.output_dir) if args.resume in (None, "latest") else Path(args.resume))
@@ -95,6 +114,7 @@ def main():
     weights = None
     while step < (1 if args.gpu_smoke_test else config.max_train_steps):
         for batch in dataloader:
+            trace("first batch received")
             with accelerator.accumulate(transformer):
                 batch = {key: value.to(accelerator.device) for key, value in batch.items() if key in {"rgb", "disparity", "raymap"}}
                 assembled = assemble_aether_training_batch(batch, vae, config.history_slots)
@@ -113,6 +133,7 @@ def main():
                 optimizer_update(accelerator, optimizer, lr_scheduler, transformer, config.max_grad_norm)
             if accelerator.sync_gradients:
                 step += 1
+                trace("optimizer update completed")
                 accelerator.log({"train/loss": total.item(), "train/mse": mse.item(), "train/rgb_ms_ssim": losses.rgb.item(), "train/depth_ssi": losses.depth.item(), "train/pointmap": losses.pointmap.item()}, step=step)
                 if step % config.output_interval == 0 or step == config.max_train_steps:
                     save_checkpoint(accelerator, config.output_dir, step, manifest, keep_last=2)
@@ -128,4 +149,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--trace-smoke-test" in sys.argv:
+        print(smoke_trace_message("entrypoint reached"), flush=True)
     main()
