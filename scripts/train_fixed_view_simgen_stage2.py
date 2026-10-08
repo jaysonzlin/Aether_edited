@@ -31,6 +31,13 @@ def smoke_trace_message(boundary: str) -> str:
     return f"Stage-2 GPU smoke trace: {boundary}"
 
 
+def enable_transformer_gradient_checkpointing(transformer) -> None:
+    """Match Stage-1 activation checkpointing for 41-frame H200 training."""
+    enable = getattr(transformer, "enable_gradient_checkpointing", None)
+    if callable(enable):
+        enable()
+
+
 def _weights(config, mse, losses, accelerator):
     from aether.training.stage2_losses import calibrate_auxiliary_weights
 
@@ -101,6 +108,8 @@ def main():
     trace("dataset and dataloader created")
     pipeline, transformer, vae, scheduler, prompts = _load_training_components(config, accelerator)
     trace("components loaded")
+    enable_transformer_gradient_checkpointing(transformer)
+    trace("gradient checkpointing enabled")
     load_stage1_transformer_weights(transformer, config.stage1_checkpoint)
     trace("stage-1 transformer weights loaded")
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=config.learning_rate, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_epsilon, weight_decay=config.weight_decay)
