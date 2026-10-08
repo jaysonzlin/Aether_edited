@@ -98,11 +98,15 @@ def _pointmap_loss(predicted_disparity, predicted_raymaps, target_disparity, tar
     size = predicted_disparity.shape[-2:]
     def upsample(value):
         return functional.interpolate(value.flatten(0, 1), size=size, mode="bilinear", align_corners=False).unflatten(0, (batch, frames))
-    pred_rays, target_rays = upsample(predicted_raymaps), upsample(target_raymaps)
-    # Ray origins are stored as signed log1p values by fixed-view geometry.
-    for raymaps in (pred_rays, target_rays):
+
+    def decode_ray_origins(raymaps):
+        # Ray origins are stored as signed log1p values by fixed-view geometry.
         origins = raymaps[:, :, 3:]
-        raymaps[:, :, 3:] = origins.sign() * (origins.abs().exp() - 1)
+        decoded_origins = origins.sign() * (origins.abs().exp() - 1)
+        return torch.cat((raymaps[:, :, :3], decoded_origins), dim=2)
+
+    pred_rays = decode_ray_origins(upsample(predicted_raymaps))
+    target_rays = decode_ray_origins(upsample(target_raymaps))
     pred_depth = predicted_disparity.detach().clamp_min(1e-3).reciprocal()
     target_depth = target_disparity.clamp_min(1e-3).reciprocal()
     pred = pred_depth.unsqueeze(2) * pred_rays[:, :, :3] + pred_rays[:, :, 3:]
