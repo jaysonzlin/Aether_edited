@@ -82,7 +82,7 @@ def _decode(vae, latents):
     """Decode [B,T,C,H,W] latent video while retaining gradients to latents."""
     scaling = float(getattr(vae.config, "scaling_factor", 1.0))
     decoder_input = latents / scaling if not getattr(vae.config, "invert_scale_latents", False) else latents * scaling
-    return vae.decode(decoder_input.permute(0, 2, 1, 3, 4)).sample
+    return vae.decode(decoder_input.to(dtype=vae.dtype).permute(0, 2, 1, 3, 4)).sample
 
 
 def _pointmap_loss(predicted_disparity, predicted_raymaps, target_disparity, target_raymaps):
