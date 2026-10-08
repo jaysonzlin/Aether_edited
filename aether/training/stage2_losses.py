@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+# The 41-frame clip supports three 11x11x11 SSIM pyramid levels. The default
+# five levels reduce time to five frames, where reflected temporal padding fails.
+MS_SSIM_41_FRAME_BETAS = (0.0448, 0.2856, 0.6696)
+
+
 def reconstruct_clean_latents(scheduler, noisy_latents, prediction, timesteps):
     """Recover x0 from an epsilon or velocity prediction without scheduler.step."""
     import torch
@@ -119,7 +124,12 @@ def compute_stage2_losses(vae, clean_latents, batch):
     predicted_disparity = _decode(vae, clean_latents[:, :, 16:32])
     pred_rgb = _content((predicted_rgb * 0.5 + 0.5).clamp(0, 1))
     target_rgb = _content(batch["rgb"].permute(0, 2, 1, 3, 4))
-    rgb_loss = 1 - multiscale_structural_similarity_index_measure(pred_rgb.float(), target_rgb.float(), data_range=1.0)
+    rgb_loss = 1 - multiscale_structural_similarity_index_measure(
+        pred_rgb.float(),
+        target_rgb.float(),
+        data_range=1.0,
+        betas=MS_SSIM_41_FRAME_BETAS,
+    )
     pred_depth = decoded_disparity(predicted_disparity)
     target_depth = ((batch["disparity"][:, :, 0] * 0.5 + 0.5).clamp(0, 1)).square()
     depth_loss = depth_ssi_loss(_content(pred_depth), _content(target_depth))

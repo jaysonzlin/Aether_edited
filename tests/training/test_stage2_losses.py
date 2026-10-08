@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import torch
 
-from aether.training.stage2_losses import _decode
+from aether.training.stage2_losses import MS_SSIM_41_FRAME_BETAS, _decode
+
+
+def test_41_frame_ms_ssim_uses_a_three_scale_temporal_pyramid():
+    assert MS_SSIM_41_FRAME_BETAS == (0.0448, 0.2856, 0.6696)
 
 
 def test_decode_casts_clean_latents_to_the_frozen_vae_dtype_and_keeps_gradients():
