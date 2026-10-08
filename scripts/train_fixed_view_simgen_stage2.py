@@ -21,6 +21,10 @@ def _calibration_path(config):
     return Path(config.output_dir) / "stage2_loss_calibration.json"
 
 
+def smoke_result_message(step: int, loss: float) -> str:
+    return f"Stage-2 GPU smoke test passed: completed {step} optimizer update (loss={loss:.6f})"
+
+
 def _weights(config, mse, losses, accelerator):
     from aether.training.stage2_losses import calibrate_auxiliary_weights
 
@@ -115,6 +119,8 @@ def main():
                     if accelerator.is_main_process:
                         save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
                 if step >= (1 if args.gpu_smoke_test else config.max_train_steps):
+                    if args.gpu_smoke_test:
+                        accelerator.print(smoke_result_message(step, float(total.detach().float().item())))
                     return
 
 
