@@ -59,6 +59,63 @@ def enable_vae_gradient_checkpointing(vae) -> None:
         enable()
 
 
+def stage2_tracker_config(config) -> dict[str, object]:
+    return {
+        "learning_rate": config.learning_rate,
+        "max_train_steps": config.max_train_steps,
+        "onecycle_pct_start": config.onecycle_pct_start,
+        "adam_beta1": config.adam_beta1,
+        "adam_beta2": config.adam_beta2,
+        "adam_epsilon": config.adam_epsilon,
+        "weight_decay": config.weight_decay,
+        "max_grad_norm": config.max_grad_norm,
+        "output_interval": config.output_interval,
+        "stage1_checkpoint": config.stage1_checkpoint,
+        "rgb_loss_weight": config.rgb_loss_weight,
+        "depth_loss_weight": config.depth_loss_weight,
+        "pointmap_loss_weight": config.pointmap_loss_weight,
+    }
+
+
+def initialize_stage2_tracking(accelerator, config) -> bool:
+    if not config.report_to:
+        return False
+    accelerator.init_trackers(config.wandb_project, config=stage2_tracker_config(config))
+    return True
+
+
+def finish_stage2_tracking(accelerator, initialized: bool) -> None:
+    if initialized:
+        accelerator.end_training()
+
+
+def _metric_float(value) -> float:
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        return float(detach().float().item())
+    return float(value)
+
+
+def stage2_metric_values(*, total, mse, losses, learning_rate, grad_norm) -> dict[str, float]:
+    return {
+        "train/loss": _metric_float(total),
+        "train/mse": _metric_float(mse),
+        "train/rgb_ms_ssim": _metric_float(losses.rgb),
+        "train/depth_ssi": _metric_float(losses.depth),
+        "train/pointmap": _metric_float(losses.pointmap),
+        "train/learning_rate": _metric_float(learning_rate),
+        "train/grad_norm": _metric_float(grad_norm),
+    }
+
+
+def stage2_calibration_metric_values(weights) -> dict[str, float]:
+    return {
+        "train/calibrated_rgb_weight": _metric_float(weights["rgb"]),
+        "train/calibrated_depth_weight": _metric_float(weights["depth"]),
+        "train/calibrated_pointmap_weight": _metric_float(weights["pointmap"]),
+    }
+
+
 def _weights(config, mse, losses, accelerator):
     from aether.training.stage2_losses import calibrate_auxiliary_weights
 

@@ -106,6 +106,10 @@ def _validate(raw: dict[str, Any]) -> Stage2TrainingConfig:
         raise Stage2TrainingConfigError("loss weights must be positive")
     if config.train_batch_size != 1 or config.gradient_accumulation_steps != 1:
         raise Stage2TrainingConfigError("Stage-2 requires batch size and accumulation of one")
+    if config.report_to not in (None, "wandb"):
+        raise Stage2TrainingConfigError("report_to must be 'wandb' or null")
+    if not isinstance(config.wandb_project, str) or not config.wandb_project.strip():
+        raise Stage2TrainingConfigError("wandb_project must be a non-empty string")
     return config
 
 

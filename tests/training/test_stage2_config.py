@@ -74,3 +74,20 @@ def test_stage2_config_rejects_values_outside_contract(tmp_path, field, value, m
 
     with pytest.raises(Stage2TrainingConfigError, match=message):
         load_stage2_training_config(path)
+
+
+@pytest.mark.parametrize("report_to", ["tensorboard", "mlflow"])
+def test_stage2_config_rejects_unsupported_tracker(tmp_path, report_to):
+    path = tmp_path / "stage2.yaml"
+    _write_config(path, report_to=report_to)
+
+    with pytest.raises(Stage2TrainingConfigError, match="report_to"):
+        load_stage2_training_config(path)
+
+
+def test_stage2_config_rejects_blank_wandb_project(tmp_path):
+    path = tmp_path / "stage2.yaml"
+    _write_config(path, wandb_project="   ")
+
+    with pytest.raises(Stage2TrainingConfigError, match="wandb_project"):
+        load_stage2_training_config(path)
