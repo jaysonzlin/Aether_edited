@@ -101,3 +101,16 @@ diagnostics, not separately weighted objectives; `train/loss` remains the
 single optimization objective and equals the channel-count-weighted mean of
 the three component losses. The disparity metric is latent-space diffusion
 loss, not pixel-space or metric-depth error. No PC predictor loss is included.
+
+## Stage-2 launch and metrics
+
+Submit Stage 2 with `sbatch submit_fixed_view_simgen_stage2_4gpu_mamba.sh`.
+Requeues append Slurm output and write NCCL diagnostics under
+`logs/nccl-aether-fixed-view-stage2-<job-id>/`.
+
+Stage 2 reports to the `aether-fixed-view-simgen-stage2` W&B project when the
+environment has been authenticated with `wandb login` or `WANDB_API_KEY`. Use
+`--override report_to=null` to disable reporting. It logs total loss, diffusion
+MSE, RGB MS-SSIM, depth SSI, point-map loss, learning rate, gradient norm, and
+the effective calibrated auxiliary weights. It does not upload media or
+artifacts to W&B.

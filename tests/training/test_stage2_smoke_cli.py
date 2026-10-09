@@ -108,6 +108,20 @@ def test_stage2_calibration_metric_values_report_effective_weights():
     }
 
 
+def test_finish_stage2_tracking_only_closes_initialized_tracker_and_preserves_errors():
+    uninitialized = RecordingAccelerator()
+    stage2.finish_stage2_tracking(uninitialized, initialized=False)
+    assert uninitialized.finished is False
+
+    initialized = RecordingAccelerator()
+    with pytest.raises(RuntimeError, match="training failed"):
+        try:
+            raise RuntimeError("training failed")
+        finally:
+            stage2.finish_stage2_tracking(initialized, initialized=True)
+    assert initialized.finished is True
+
+
 def test_smoke_result_message_reports_completed_update_and_loss():
     assert smoke_result_message(1, 2.5) == "Stage-2 GPU smoke test passed: completed 1 optimizer update (loss=2.500000)"
 

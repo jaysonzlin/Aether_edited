@@ -186,6 +186,7 @@ def main():
         preflight(config)
         return
     accelerator = Accelerator(**accelerator_options(config))
+    tracking_initialized = initialize_stage2_tracking(accelerator, config)
     trace("accelerator created")
     dataset = FixedViewSimGenDataset(config.data_root, config.sample_ids)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.dataloader_num_workers, pin_memory=config.pin_memory)
@@ -206,7 +207,10 @@ def main():
     manifest = {"schema_version": 1, "objective": "stage2_image_space_refinement", "stage1_checkpoint": str(config.stage1_checkpoint)}
     checkpoint = None if args.gpu_smoke_test else (latest_checkpoint(config.output_dir) if args.resume in (None, "latest") else Path(args.resume))
     step = restore_checkpoint(accelerator, checkpoint, manifest) if checkpoint else 0
+    if checkpoint:
+        accelerator.print(f"resumed checkpoint {checkpoint} at step {step}")
     weights = None
+    calibration_logged = False
     while step < (step_limit or config.max_train_steps):
         for batch in dataloader:
             trace("first batch received")
@@ -221,6 +225,8 @@ def main():
                 prediction = transformer(hidden_states=torch.cat((noisy, assembled.condition_latents), dim=2), encoder_hidden_states=prompts.repeat(noise.shape[0], 1, 1), timestep=timesteps, ofs=ofs, image_rotary_emb=rotary, return_dict=False)[0]
                 target = diffusion_training_target(scheduler, assembled.target_latents, noise, timesteps)
                 mse = functional.mse_loss(prediction.float(), target.float())
+                if not torch.isfinite(mse):
+                    raise RuntimeError("Stage-2 loss became non-finite")
                 clean_latents = reconstruct_clean_latents(scheduler, noisy, prediction, timesteps)
                 if weights is None:
                     calibration_losses = measure_stage2_losses(vae, clean_latents, batch)
@@ -230,21 +236,30 @@ def main():
                 )
                 total = mse.detach() + weights["rgb"] * losses.rgb + weights["depth"] * losses.depth + weights["pointmap"] * losses.pointmap
                 accelerator.backward(mse + latent_gradient_surrogate(clean_latents, auxiliary_gradient))
-                optimizer_update(accelerator, optimizer, lr_scheduler, transformer, config.max_grad_norm)
+                grad_norm = optimizer_update(accelerator, optimizer, lr_scheduler, transformer, config.max_grad_norm)
             if accelerator.sync_gradients:
                 step += 1
                 trace("optimizer update completed")
-                accelerator.log({"train/loss": total.item(), "train/mse": mse.item(), "train/rgb_ms_ssim": losses.rgb.item(), "train/depth_ssi": losses.depth.item(), "train/pointmap": losses.pointmap.item()}, step=step)
+                learning_rate = lr_scheduler.get_last_lr()[0]
+                if tracking_initialized and accelerator.is_main_process:
+                    if not calibration_logged:
+                        accelerator.log(stage2_calibration_metric_values(weights), step=step)
+                        calibration_logged = True
+                    accelerator.log(stage2_metric_values(total=total, mse=mse, losses=losses, learning_rate=learning_rate, grad_norm=0.0 if grad_norm is None else grad_norm), step=step)
                 if step % config.output_interval == 0 or step == config.max_train_steps:
-                    save_checkpoint(accelerator, config.output_dir, step, manifest, keep_last=2)
+                    saved_checkpoint = save_checkpoint(accelerator, config.output_dir, step, manifest, keep_last=2)
+                    accelerator.print(f"saved checkpoint: {saved_checkpoint}")
                     if accelerator.is_main_process:
-                        save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
+                        artifacts = save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
+                        accelerator.print("saved fixed rollout artifacts: " + ", ".join(str(path) for path in artifacts))
+                    accelerator.wait_for_everyone()
                 if step >= (step_limit or config.max_train_steps):
                     if args.gpu_smoke_test:
                         print(
                             smoke_result_message(step, float(total.detach().float().item())),
                             flush=True,
                         )
+                    finish_stage2_tracking(accelerator, tracking_initialized)
                     return
 
 
