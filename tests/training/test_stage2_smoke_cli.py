@@ -122,6 +122,50 @@ def test_finish_stage2_tracking_only_closes_initialized_tracker_and_preserves_er
     assert initialized.finished is True
 
 
+def test_stage2_rollout_uses_keyword_only_helper_contract():
+    received = {}
+
+    def save_rollout_artifacts(*, accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompt_embeds, global_step):
+        received.update(
+            accelerator=accelerator,
+            config=config,
+            dataset=dataset,
+            pipeline=pipeline,
+            transformer=transformer,
+            vae=vae,
+            scheduler=scheduler,
+            prompt_embeds=prompt_embeds,
+            global_step=global_step,
+        )
+        return ["rollout.mp4"]
+
+    artifacts = stage2.save_stage2_rollout(
+        save_rollout_artifacts,
+        accelerator="accelerator",
+        config="config",
+        dataset="dataset",
+        pipeline="pipeline",
+        transformer="transformer",
+        vae="vae",
+        scheduler="scheduler",
+        prompts="prompts",
+        step=500,
+    )
+
+    assert artifacts == ["rollout.mp4"]
+    assert received == {
+        "accelerator": "accelerator",
+        "config": "config",
+        "dataset": "dataset",
+        "pipeline": "pipeline",
+        "transformer": "transformer",
+        "vae": "vae",
+        "scheduler": "scheduler",
+        "prompt_embeds": "prompts",
+        "global_step": 500,
+    }
+
+
 def test_smoke_result_message_reports_completed_update_and_loss():
     assert smoke_result_message(1, 2.5) == "Stage-2 GPU smoke test passed: completed 1 optimizer update (loss=2.500000)"
 

@@ -116,6 +116,32 @@ def stage2_calibration_metric_values(weights) -> dict[str, float]:
     }
 
 
+def save_stage2_rollout(
+    save_rollout_artifacts,
+    *,
+    accelerator,
+    config,
+    dataset,
+    pipeline,
+    transformer,
+    vae,
+    scheduler,
+    prompts,
+    step,
+):
+    return save_rollout_artifacts(
+        accelerator=accelerator,
+        config=config,
+        dataset=dataset,
+        pipeline=pipeline,
+        transformer=transformer,
+        vae=vae,
+        scheduler=scheduler,
+        prompt_embeds=prompts,
+        global_step=step,
+    )
+
+
 def _weights(config, mse, losses, accelerator):
     from aether.training.stage2_losses import calibrate_auxiliary_weights
 
@@ -250,7 +276,18 @@ def main():
                     saved_checkpoint = save_checkpoint(accelerator, config.output_dir, step, manifest, keep_last=2)
                     accelerator.print(f"saved checkpoint: {saved_checkpoint}")
                     if accelerator.is_main_process:
-                        artifacts = save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
+                        artifacts = save_stage2_rollout(
+                            save_fixed_rollout_artifacts,
+                            accelerator=accelerator,
+                            config=config,
+                            dataset=dataset,
+                            pipeline=pipeline,
+                            transformer=transformer,
+                            vae=vae,
+                            scheduler=scheduler,
+                            prompts=prompts,
+                            step=step,
+                        )
                         accelerator.print("saved fixed rollout artifacts: " + ", ".join(str(path) for path in artifacts))
                     accelerator.wait_for_everyone()
                 if step >= (step_limit or config.max_train_steps):
