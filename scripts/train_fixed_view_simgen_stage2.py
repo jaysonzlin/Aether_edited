@@ -8,15 +8,29 @@ import sys
 from pathlib import Path
 
 
-def parse_args():
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/train/fixed_view_simgen_stage2_4h200.yaml")
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--resume", nargs="?", const="latest")
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--gpu-smoke-test", action="store_true")
+    parser.add_argument("--gpu-smoke-test-steps", type=_positive_int)
     parser.add_argument("--trace-smoke-test", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.gpu_smoke_test_steps is not None and not args.gpu_smoke_test:
+        parser.error("--gpu-smoke-test-steps requires --gpu-smoke-test")
+    return args
 
 
 def _calibration_path(config):
@@ -86,6 +100,7 @@ def preflight(config):
 def main():
     args = parse_args()
     trace_smoke = args.gpu_smoke_test and args.trace_smoke_test
+    step_limit = (args.gpu_smoke_test_steps or 1) if args.gpu_smoke_test else None
 
     def trace(boundary: str) -> None:
         if trace_smoke:
@@ -130,7 +145,7 @@ def main():
     checkpoint = None if args.gpu_smoke_test else (latest_checkpoint(config.output_dir) if args.resume in (None, "latest") else Path(args.resume))
     step = restore_checkpoint(accelerator, checkpoint, manifest) if checkpoint else 0
     weights = None
-    while step < (1 if args.gpu_smoke_test else config.max_train_steps):
+    while step < (step_limit or config.max_train_steps):
         for batch in dataloader:
             trace("first batch received")
             with accelerator.accumulate(transformer):
@@ -157,7 +172,7 @@ def main():
                     save_checkpoint(accelerator, config.output_dir, step, manifest, keep_last=2)
                     if accelerator.is_main_process:
                         save_fixed_rollout_artifacts(accelerator, config, dataset, pipeline, transformer, vae, scheduler, prompts, step)
-                if step >= (1 if args.gpu_smoke_test else config.max_train_steps):
+                if step >= (step_limit or config.max_train_steps):
                     if args.gpu_smoke_test:
                         print(
                             smoke_result_message(step, float(total.detach().float().item())),

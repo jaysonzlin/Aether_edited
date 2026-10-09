@@ -1,6 +1,9 @@
+import pytest
+
 from scripts.train_fixed_view_simgen_stage2 import (
     enable_transformer_gradient_checkpointing,
     enable_vae_gradient_checkpointing,
+    parse_args,
     smoke_result_message,
     smoke_trace_message,
 )
@@ -12,6 +15,17 @@ def test_smoke_result_message_reports_completed_update_and_loss():
 
 def test_smoke_trace_message_labels_execution_boundary():
     assert smoke_trace_message("components loaded") == "Stage-2 GPU smoke trace: components loaded"
+
+
+def test_gpu_smoke_test_accepts_a_two_update_limit():
+    args = parse_args(["--gpu-smoke-test", "--gpu-smoke-test-steps", "2"])
+
+    assert args.gpu_smoke_test_steps == 2
+
+
+def test_gpu_smoke_step_limit_requires_gpu_smoke_mode():
+    with pytest.raises(SystemExit):
+        parse_args(["--gpu-smoke-test-steps", "2"])
 
 
 def test_stage2_enables_transformer_gradient_checkpointing_when_supported():
