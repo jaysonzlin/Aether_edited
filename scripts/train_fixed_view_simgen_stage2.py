@@ -115,7 +115,12 @@ def main():
     from aether.training.checkpointing import latest_checkpoint, load_stage1_transformer_weights, restore_checkpoint, save_checkpoint
     from aether.training.simgen_dataset import FixedViewSimGenDataset
     from aether.training.stage2_config import load_stage2_training_config
-    from aether.training.stage2_losses import compute_stage2_losses, reconstruct_clean_latents
+    from aether.training.stage2_losses import (
+        latent_gradient_surrogate,
+        measure_stage2_losses,
+        reconstruct_clean_latents,
+        stage2_latent_gradient,
+    )
     from scripts.train_fixed_view_simgen import _load_training_components, accelerator_options, diffusion_training_target, optimizer_update, save_fixed_rollout_artifacts, unwrapped_transformer_config
 
     config = load_stage2_training_config(args.config, args.override)
@@ -159,10 +164,15 @@ def main():
                 prediction = transformer(hidden_states=torch.cat((noisy, assembled.condition_latents), dim=2), encoder_hidden_states=prompts.repeat(noise.shape[0], 1, 1), timestep=timesteps, ofs=ofs, image_rotary_emb=rotary, return_dict=False)[0]
                 target = diffusion_training_target(scheduler, assembled.target_latents, noise, timesteps)
                 mse = functional.mse_loss(prediction.float(), target.float())
-                losses = compute_stage2_losses(vae, reconstruct_clean_latents(scheduler, noisy, prediction, timesteps), batch)
-                weights = weights or _weights(config, mse, losses, accelerator)
-                total = mse + weights["rgb"] * losses.rgb + weights["depth"] * losses.depth + weights["pointmap"] * losses.pointmap
-                accelerator.backward(total)
+                clean_latents = reconstruct_clean_latents(scheduler, noisy, prediction, timesteps)
+                if weights is None:
+                    calibration_losses = measure_stage2_losses(vae, clean_latents, batch)
+                    weights = _weights(config, mse, calibration_losses, accelerator)
+                losses, auxiliary_gradient = stage2_latent_gradient(
+                    vae, clean_latents, batch, weights
+                )
+                total = mse.detach() + weights["rgb"] * losses.rgb + weights["depth"] * losses.depth + weights["pointmap"] * losses.pointmap
+                accelerator.backward(mse + latent_gradient_surrogate(clean_latents, auxiliary_gradient))
                 optimizer_update(accelerator, optimizer, lr_scheduler, transformer, config.max_grad_norm)
             if accelerator.sync_gradients:
                 step += 1

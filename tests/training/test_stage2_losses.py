@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import torch
 
-from aether.training.stage2_losses import MS_SSIM_41_FRAME_BETAS, _decode, _pointmap_loss
+from aether.training.stage2_losses import (
+    MS_SSIM_41_FRAME_BETAS,
+    _decode,
+    _pointmap_loss,
+    latent_gradient_surrogate,
+)
 
 
 def test_41_frame_ms_ssim_uses_a_three_scale_temporal_pyramid():
@@ -44,3 +49,17 @@ def test_pointmap_loss_backpropagates_through_signed_log_ray_origins_without_inp
     loss.backward()
 
     assert raw_predicted_raymaps.grad is not None
+
+
+def test_latent_gradient_surrogate_matches_sequential_auxiliary_loss_gradients():
+    source = torch.tensor([1.5], requires_grad=True)
+    clean_latents = source * 2
+    rgb_loss = clean_latents.square().sum()
+    rgb_gradient = torch.autograd.grad(rgb_loss, clean_latents)[0]
+    depth_loss = clean_latents.sin().sum()
+    depth_gradient = torch.autograd.grad(depth_loss, clean_latents)[0]
+
+    latent_gradient_surrogate(clean_latents, rgb_gradient + depth_gradient).backward()
+
+    expected = 2 * (2 * clean_latents.detach() + clean_latents.detach().cos())
+    assert torch.allclose(source.grad, expected)

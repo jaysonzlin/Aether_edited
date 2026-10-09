@@ -119,25 +119,80 @@ def _pointmap_loss(predicted_disparity, predicted_raymaps, target_disparity, tar
     return (weights * (scale * centered_pred - centered_target).abs()).sum() / weights.sum().clamp_min(1e-6)
 
 
-def compute_stage2_losses(vae, clean_latents, batch):
-    """Compute the paper's three decoded losses over valid fixed-view content."""
+def _rgb_loss(vae, clean_latents, batch):
+    """Compute RGB MS-SSIM without retaining an unrelated disparity decode."""
     import torch
     from torchmetrics.functional.image import multiscale_structural_similarity_index_measure
 
     predicted_rgb = _decode(vae, clean_latents[:, :, :16])
-    predicted_disparity = _decode(vae, clean_latents[:, :, 16:32])
     pred_rgb = _content((predicted_rgb * 0.5 + 0.5).clamp(0, 1))
     target_rgb = _content(batch["rgb"].permute(0, 2, 1, 3, 4))
-    rgb_loss = 1 - multiscale_structural_similarity_index_measure(
+    loss = 1 - multiscale_structural_similarity_index_measure(
         pred_rgb.float(),
         target_rgb.float(),
         data_range=1.0,
         betas=MS_SSIM_41_FRAME_BETAS,
     )
+    if not torch.isfinite(loss):
+        raise RuntimeError("Stage-2 RGB MS-SSIM loss became non-finite")
+    return loss
+
+
+def _depth_and_pointmap_losses(vae, clean_latents, batch):
+    """Compute geometry losses from one decoded disparity stream."""
+    import torch
+
+    predicted_disparity = _decode(vae, clean_latents[:, :, 16:32])
     pred_depth = decoded_disparity(predicted_disparity)
     target_depth = ((batch["disparity"][:, :, 0] * 0.5 + 0.5).clamp(0, 1)).square()
     depth_loss = depth_ssi_loss(_content(pred_depth), _content(target_depth))
     pointmap_loss = _pointmap_loss(pred_depth, unpack_raymaps(clean_latents[:, :, 32:]), target_depth, unpack_raymaps(batch["raymap"]))
-    if not all(torch.isfinite(value) for value in (rgb_loss, depth_loss, pointmap_loss)):
-        raise RuntimeError("Stage-2 decoded loss became non-finite")
+    if not all(torch.isfinite(value) for value in (depth_loss, pointmap_loss)):
+        raise RuntimeError("Stage-2 geometry loss became non-finite")
+    return depth_loss, pointmap_loss
+
+
+def compute_stage2_losses(vae, clean_latents, batch):
+    """Compute the paper's three decoded losses over valid fixed-view content."""
+    rgb_loss = _rgb_loss(vae, clean_latents, batch)
+    depth_loss, pointmap_loss = _depth_and_pointmap_losses(vae, clean_latents, batch)
     return Stage2Losses(rgb_loss, depth_loss, pointmap_loss)
+
+
+def measure_stage2_losses(vae, clean_latents, batch):
+    """Measure decoded losses without retaining VAE autograd state for calibration."""
+    import torch
+
+    with torch.no_grad():
+        return compute_stage2_losses(vae, clean_latents, batch)
+
+
+def stage2_latent_gradient(vae, clean_latents, batch, weights):
+    """Return decoded loss values and their weighted gradient at clean latents.
+
+    RGB and geometry VJPs are evaluated sequentially so only one VAE decoder
+    graph is resident at a time. The returned gradient is mathematically the
+    same decoded-loss contribution as a joint backward pass.
+    """
+    import torch
+
+    rgb_loss = _rgb_loss(vae, clean_latents, batch)
+    rgb_gradient = torch.autograd.grad(
+        weights["rgb"] * rgb_loss,
+        clean_latents,
+    )[0]
+    rgb_value = rgb_loss.detach()
+    del rgb_loss
+
+    depth_loss, pointmap_loss = _depth_and_pointmap_losses(vae, clean_latents, batch)
+    geometry_gradient = torch.autograd.grad(
+        weights["depth"] * depth_loss + weights["pointmap"] * pointmap_loss,
+        clean_latents,
+    )[0]
+    losses = Stage2Losses(rgb_value, depth_loss.detach(), pointmap_loss.detach())
+    return losses, rgb_gradient + geometry_gradient
+
+
+def latent_gradient_surrogate(clean_latents, latent_gradient):
+    """Inject an externally computed clean-latent gradient into one backward pass."""
+    return (clean_latents * latent_gradient.detach()).sum()
