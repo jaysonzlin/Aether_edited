@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+#SBATCH --mail-user=jlin3@college.harvard.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --job-name=aether_fixed_view_simgen_stage2_4gpu
 #SBATCH --partition=gpu_requeue
 #SBATCH --constraint=h200&holyndr
