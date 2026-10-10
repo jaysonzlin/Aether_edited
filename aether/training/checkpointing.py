@@ -374,12 +374,14 @@ def _checkpoint_candidates(output_dir: str | Path) -> list[Path]:
     )
 
 
-def _missing_accelerate_state_files(checkpoint: Path, process_index: int) -> list[str]:
-    required_files = (
+def _missing_accelerate_state_files(checkpoint: Path, num_processes: int) -> list[str]:
+    required_files = [
         "model.safetensors",
         "optimizer.bin",
         "scheduler.bin",
-        f"random_states_{process_index}.pkl",
+    ]
+    required_files.extend(
+        f"random_states_{process_index}.pkl" for process_index in range(num_processes)
     )
     return [filename for filename in required_files if not (checkpoint / filename).is_file()]
 
@@ -389,16 +391,16 @@ def restore_latest_checkpoint_with_fallback(
     output_dir: str | Path,
     expected_manifest: Mapping[str, object],
 ) -> tuple[Path | None, int]:
-    """Restore the newest complete checkpoint, falling back after validation or load failures."""
+    """Restore the newest complete checkpoint, or start fresh when none can be restored."""
     candidates = _checkpoint_candidates(output_dir)
     if not candidates:
         return None, 0
 
     failures: list[tuple[Path, Exception]] = []
     printer = getattr(accelerator, "print", print)
-    process_index = getattr(accelerator, "process_index", 0)
+    num_processes = max(1, int(getattr(accelerator, "num_processes", 1)))
     for checkpoint in candidates:
-        missing_files = _missing_accelerate_state_files(checkpoint, process_index)
+        missing_files = _missing_accelerate_state_files(checkpoint, num_processes)
         if missing_files:
             error = FileNotFoundError(
                 "missing required checkpoint files: " + ", ".join(missing_files)
@@ -415,6 +417,8 @@ def restore_latest_checkpoint_with_fallback(
             return checkpoint, step
 
     attempted = ", ".join(path.name for path, _ in failures)
-    raise RuntimeError(
-        f"Could not resume any checkpoint selected by latest: {attempted}"
-    ) from failures[-1][1]
+    printer(
+        f"Could not resume any checkpoint selected by latest: {attempted}; "
+        "starting training from scratch"
+    )
+    return None, 0

@@ -60,6 +60,7 @@ class FakeAccelerator:
         self.load_attempts = []
         self.failing_checkpoints = set()
         self.process_index = 0
+        self.num_processes = 1
 
     def save_state(self, path):
         path = Path(path)
@@ -74,14 +75,11 @@ class FakeAccelerator:
         self.restored_path = path
 
 
-def _write_complete_accelerate_state(checkpoint):
-    for filename in (
-        "model.safetensors",
-        "optimizer.bin",
-        "scheduler.bin",
-        "random_states_0.pkl",
-    ):
+def _write_complete_accelerate_state(checkpoint, num_processes=1):
+    for filename in ("model.safetensors", "optimizer.bin", "scheduler.bin"):
         (checkpoint / filename).touch()
+    for process_index in range(num_processes):
+        (checkpoint / f"random_states_{process_index}.pkl").touch()
 
 
 def test_restore_returns_the_saved_global_step(tmp_path):
@@ -160,6 +158,44 @@ def test_resume_latest_falls_back_when_the_newest_complete_state_cannot_load(tmp
     assert resumed_checkpoint == checkpoint_500
     assert step == 500
     assert accelerator.load_attempts == [checkpoint_1000, checkpoint_500]
+
+
+def test_resume_latest_starts_fresh_when_no_checkpoint_can_be_restored(tmp_path):
+    accelerator = FakeAccelerator()
+    checkpoint = save_checkpoint(
+        accelerator, tmp_path, global_step=500, run_manifest=RUN_MANIFEST
+    )
+    _write_complete_accelerate_state(checkpoint)
+    accelerator.failing_checkpoints.add(checkpoint.name)
+
+    resumed_checkpoint, step = restore_latest_checkpoint_with_fallback(
+        accelerator, tmp_path, RUN_MANIFEST
+    )
+
+    assert resumed_checkpoint is None
+    assert step == 0
+    assert accelerator.load_attempts == [checkpoint]
+
+
+def test_resume_latest_requires_random_state_for_every_rank(tmp_path):
+    accelerator = FakeAccelerator()
+    accelerator.num_processes = 4
+    checkpoint_500 = save_checkpoint(
+        accelerator, tmp_path, global_step=500, run_manifest=RUN_MANIFEST
+    )
+    checkpoint_1000 = save_checkpoint(
+        accelerator, tmp_path, global_step=1_000, run_manifest=RUN_MANIFEST
+    )
+    _write_complete_accelerate_state(checkpoint_500, num_processes=4)
+    _write_complete_accelerate_state(checkpoint_1000, num_processes=3)
+
+    resumed_checkpoint, step = restore_latest_checkpoint_with_fallback(
+        accelerator, tmp_path, RUN_MANIFEST
+    )
+
+    assert resumed_checkpoint == checkpoint_500
+    assert step == 500
+    assert accelerator.load_attempts == [checkpoint_500]
 
 
 def test_latest_checkpoint_selects_the_highest_valid_step(tmp_path):
