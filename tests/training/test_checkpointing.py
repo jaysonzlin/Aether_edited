@@ -8,6 +8,7 @@ from aether.training.checkpointing import (
     latest_checkpoint,
     build_run_manifest,
     restore_checkpoint,
+    restore_latest_checkpoint_with_fallback,
     save_checkpoint,
 )
 
@@ -56,6 +57,9 @@ RUN_MANIFEST = {
 class FakeAccelerator:
     def __init__(self):
         self.restored_path = None
+        self.load_attempts = []
+        self.failing_checkpoints = set()
+        self.process_index = 0
 
     def save_state(self, path):
         path = Path(path)
@@ -63,7 +67,21 @@ class FakeAccelerator:
         (path / "state.txt").write_text("state")
 
     def load_state(self, path):
-        self.restored_path = Path(path)
+        path = Path(path)
+        self.load_attempts.append(path)
+        if path.name in self.failing_checkpoints:
+            raise RuntimeError(f"cannot load {path.name}")
+        self.restored_path = path
+
+
+def _write_complete_accelerate_state(checkpoint):
+    for filename in (
+        "model.safetensors",
+        "optimizer.bin",
+        "scheduler.bin",
+        "random_states_0.pkl",
+    ):
+        (checkpoint / filename).touch()
 
 
 def test_restore_returns_the_saved_global_step(tmp_path):
@@ -104,6 +122,44 @@ def test_save_checkpoint_replaces_an_incomplete_checkpoint_directory(tmp_path):
     assert saved_checkpoint == checkpoint
     assert (checkpoint / "state.txt").read_text() == "state"
     assert not (checkpoint / "partial-state.txt").exists()
+
+
+def test_resume_latest_skips_checkpoint_missing_required_accelerate_state(tmp_path):
+    accelerator = FakeAccelerator()
+    checkpoint = save_checkpoint(
+        accelerator, tmp_path, global_step=500, run_manifest=RUN_MANIFEST
+    )
+    _write_complete_accelerate_state(checkpoint)
+    (tmp_path / "checkpoint-001000").mkdir()
+
+    resumed_checkpoint, step = restore_latest_checkpoint_with_fallback(
+        accelerator, tmp_path, RUN_MANIFEST
+    )
+
+    assert resumed_checkpoint == checkpoint
+    assert step == 500
+    assert accelerator.load_attempts == [checkpoint]
+
+
+def test_resume_latest_falls_back_when_the_newest_complete_state_cannot_load(tmp_path):
+    accelerator = FakeAccelerator()
+    checkpoint_500 = save_checkpoint(
+        accelerator, tmp_path, global_step=500, run_manifest=RUN_MANIFEST
+    )
+    checkpoint_1000 = save_checkpoint(
+        accelerator, tmp_path, global_step=1_000, run_manifest=RUN_MANIFEST
+    )
+    _write_complete_accelerate_state(checkpoint_500)
+    _write_complete_accelerate_state(checkpoint_1000)
+    accelerator.failing_checkpoints.add(checkpoint_1000.name)
+
+    resumed_checkpoint, step = restore_latest_checkpoint_with_fallback(
+        accelerator, tmp_path, RUN_MANIFEST
+    )
+
+    assert resumed_checkpoint == checkpoint_500
+    assert step == 500
+    assert accelerator.load_attempts == [checkpoint_1000, checkpoint_500]
 
 
 def test_latest_checkpoint_selects_the_highest_valid_step(tmp_path):

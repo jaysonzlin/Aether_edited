@@ -359,3 +359,62 @@ def restore_checkpoint(
         )
     accelerator.load_state(checkpoint_path)
     return global_step
+
+
+def _checkpoint_candidates(output_dir: str | Path) -> list[Path]:
+    output_path = Path(output_dir)
+    return sorted(
+        (
+            path
+            for path in output_path.glob("checkpoint-*")
+            if path.is_dir() and path.name.removeprefix("checkpoint-").isdigit()
+        ),
+        key=lambda path: int(path.name.removeprefix("checkpoint-")),
+        reverse=True,
+    )
+
+
+def _missing_accelerate_state_files(checkpoint: Path, process_index: int) -> list[str]:
+    required_files = (
+        "model.safetensors",
+        "optimizer.bin",
+        "scheduler.bin",
+        f"random_states_{process_index}.pkl",
+    )
+    return [filename for filename in required_files if not (checkpoint / filename).is_file()]
+
+
+def restore_latest_checkpoint_with_fallback(
+    accelerator: AcceleratorState,
+    output_dir: str | Path,
+    expected_manifest: Mapping[str, object],
+) -> tuple[Path | None, int]:
+    """Restore the newest complete checkpoint, falling back after validation or load failures."""
+    candidates = _checkpoint_candidates(output_dir)
+    if not candidates:
+        return None, 0
+
+    failures: list[tuple[Path, Exception]] = []
+    printer = getattr(accelerator, "print", print)
+    process_index = getattr(accelerator, "process_index", 0)
+    for checkpoint in candidates:
+        missing_files = _missing_accelerate_state_files(checkpoint, process_index)
+        if missing_files:
+            error = FileNotFoundError(
+                "missing required checkpoint files: " + ", ".join(missing_files)
+            )
+            failures.append((checkpoint, error))
+            printer(f"Could not resume {checkpoint}; trying the next most recent checkpoint: {error}")
+            continue
+        try:
+            step = restore_checkpoint(accelerator, checkpoint, expected_manifest)
+        except Exception as error:
+            failures.append((checkpoint, error))
+            printer(f"Could not resume {checkpoint}; trying the next most recent checkpoint: {error}")
+        else:
+            return checkpoint, step
+
+    attempted = ", ".join(path.name for path, _ in failures)
+    raise RuntimeError(
+        f"Could not resume any checkpoint selected by latest: {attempted}"
+    ) from failures[-1][1]

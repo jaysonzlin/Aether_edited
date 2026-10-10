@@ -195,7 +195,12 @@ def main():
     import torch
     import torch.nn.functional as functional
     from aether.training.aether_latents import assemble_aether_training_batch
-    from aether.training.checkpointing import latest_checkpoint, load_stage1_transformer_weights, restore_checkpoint, save_checkpoint
+    from aether.training.checkpointing import (
+        load_stage1_transformer_weights,
+        restore_checkpoint,
+        restore_latest_checkpoint_with_fallback,
+        save_checkpoint,
+    )
     from aether.training.simgen_dataset import FixedViewSimGenDataset
     from aether.training.stage2_config import load_stage2_training_config
     from aether.training.stage2_losses import (
@@ -231,8 +236,15 @@ def main():
     trace("training state prepared")
     transformer_config = unwrapped_transformer_config(transformer, accelerator)
     manifest = {"schema_version": 1, "objective": "stage2_image_space_refinement", "stage1_checkpoint": str(config.stage1_checkpoint)}
-    checkpoint = None if args.gpu_smoke_test else (latest_checkpoint(config.output_dir) if args.resume in (None, "latest") else Path(args.resume))
-    step = restore_checkpoint(accelerator, checkpoint, manifest) if checkpoint else 0
+    if args.gpu_smoke_test:
+        checkpoint, step = None, 0
+    elif args.resume in (None, "latest"):
+        checkpoint, step = restore_latest_checkpoint_with_fallback(
+            accelerator, config.output_dir, manifest
+        )
+    else:
+        checkpoint = Path(args.resume)
+        step = restore_checkpoint(accelerator, checkpoint, manifest)
     if checkpoint:
         accelerator.print(f"resumed checkpoint {checkpoint} at step {step}")
     weights = None
