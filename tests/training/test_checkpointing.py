@@ -92,6 +92,20 @@ def test_checkpoint_retention_keeps_the_most_recent_numbered_directories(tmp_pat
     assert (tmp_path / "checkpoint-003000").exists()
 
 
+def test_save_checkpoint_replaces_an_incomplete_checkpoint_directory(tmp_path):
+    checkpoint = tmp_path / "checkpoint-000500"
+    checkpoint.mkdir()
+    (checkpoint / "partial-state.txt").write_text("interrupted")
+
+    saved_checkpoint = save_checkpoint(
+        FakeAccelerator(), tmp_path, global_step=500, run_manifest=RUN_MANIFEST
+    )
+
+    assert saved_checkpoint == checkpoint
+    assert (checkpoint / "state.txt").read_text() == "state"
+    assert not (checkpoint / "partial-state.txt").exists()
+
+
 def test_latest_checkpoint_selects_the_highest_valid_step(tmp_path):
     accelerator = FakeAccelerator()
     save_checkpoint(accelerator, tmp_path, global_step=1_000, run_manifest=RUN_MANIFEST)

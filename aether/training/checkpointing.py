@@ -302,14 +302,20 @@ def save_checkpoint(
     run_manifest: Mapping[str, object],
     keep_last: int = 3,
 ) -> Path:
-    """Save full Accelerate state and global-step metadata without overwriting."""
+    """Save full Accelerate state and global-step metadata, replacing stale directories."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint = _checkpoint_path(output_path, global_step)
-    if checkpoint.exists():
-        raise FileExistsError(f"checkpoint already exists and will not be overwritten: {checkpoint}")
-    accelerator.save_state(checkpoint)
     wait_for_everyone = getattr(accelerator, "wait_for_everyone", None)
+    if checkpoint.exists() and getattr(accelerator, "is_main_process", True):
+        if not checkpoint.is_dir():
+            raise FileExistsError(f"checkpoint path is not a directory: {checkpoint}")
+        if checkpoint.parent.resolve() != output_path.resolve():
+            raise RuntimeError(f"refusing to replace checkpoint outside output directory: {checkpoint}")
+        shutil.rmtree(checkpoint)
+    if wait_for_everyone is not None:
+        wait_for_everyone()
+    accelerator.save_state(checkpoint)
     if wait_for_everyone is not None:
         wait_for_everyone()
     if getattr(accelerator, "is_main_process", True):
