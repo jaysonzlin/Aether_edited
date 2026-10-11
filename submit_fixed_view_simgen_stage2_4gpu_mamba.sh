@@ -4,6 +4,7 @@
 #SBATCH --job-name=aether_fixed_view_simgen_stage2_4gpu
 #SBATCH --partition=gpu_requeue
 #SBATCH --constraint=h200&holyndr
+#SBATCH --exclude=holygpu8a12204,holygpu8a18103,holygpu8a16503
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
